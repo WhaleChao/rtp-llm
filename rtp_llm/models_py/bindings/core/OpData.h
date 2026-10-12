@@ -108,6 +108,11 @@ struct GptModelInputs {
     // To select correct inference mode, we need to set this flag manually.
     bool is_target_verify = false;
 
+    // MTP draft model state extension after target verification. The outer
+    // input remains prefill-shaped (input_lengths + prefix_lengths), while
+    // MLA/Indexer must execute as flattened multi-token paged decode.
+    bool is_draft_extend = false;
+
     // not sync to other tp rank
     std::vector<std::string> trace_ids;
     // Logging-only full prefill sequences, including cached prefixes; aligned with request_id.
@@ -124,6 +129,9 @@ struct GptModelOutputs {
     torch::Tensor all_hidden_states;
     torch::Tensor all_logits;
     torch::Tensor softmax_result;
+    // Request-ordered GLM-5.2 MTP indexer seed. It stays on the draft
+    // device and is carried by GenerateStream between decode cycles.
+    torch::Tensor mtp_indexer_topk;
 
     std::vector<torch::Tensor> moe_gating;
 
