@@ -603,6 +603,32 @@ TEST_F(BroadcastManagerTest, WaitForCompletionReportsDeadlineWithoutChangingLega
     EXPECT_THROW(result.waitDone(), RTPException);
 }
 
+TEST_F(BroadcastManagerTest, DeadlineSurvivesOtherRankFailuresInEitherArrivalOrder) {
+    for (bool timeout_first : {false, true}) {
+        for (bool cq_ok : {false, true}) {
+            auto timeout    = makeIdleContext();
+            auto other      = makeIdleContext();
+            timeout->status = grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED, "deadline");
+            other->status   = grpc::Status(grpc::StatusCode::INTERNAL, "other failure");
+            FunctionBroadcastResult result({timeout, other});
+            int                     callbacks = 0;
+            result.onDone([&] { ++callbacks; });
+            EXPECT_FALSE(result.deadlineExceeded());
+            result.finishRank(timeout_first ? 0 : 1, timeout_first || cq_ok);
+            EXPECT_FALSE(result.done());
+            EXPECT_EQ(result.deadlineExceeded(), timeout_first);
+            result.finishRank(timeout_first ? 1 : 0, !timeout_first || cq_ok);
+            EXPECT_EQ(result.waitForCompletion().code(), ErrorCode::TRANSFER_COMPLETION_UNKNOWN);
+            EXPECT_TRUE(result.deadlineExceeded());
+            EXPECT_EQ(callbacks, 1);
+            result.finishRank(0, true);
+            result.finishRank(1, true);
+            EXPECT_EQ(callbacks, 1);
+            EXPECT_TRUE(result.deadlineExceeded());
+        }
+    }
+}
+
 TEST_F(BroadcastManagerTest, RejectedBroadcastNeverDispatchesAnyRank) {
     for (bool initialized : {false, true}) {
         BroadcastManager manager({"127.0.0.1:1", "127.0.0.1:2"});
