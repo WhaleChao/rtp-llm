@@ -189,7 +189,6 @@ def cuda13_suites():
                 sleep_time_qr = 10,
             ),
 
-            ":smoke_cu13_glm5x",
             # Only DeepSeek-V4-Pro case. Deliberately plain — no CUDA graph, no PD
             # separation, no speculative decode, no page-RR. The advanced feature
             # matrix is covered on Flash above; this exists so a Pro-specific
@@ -211,6 +210,7 @@ def cuda13_suites():
                 test_envs={"RTP_TEST_WATCHDOG_SECONDS": "3600"},
                 gpu_type=[cuda13_x86_test_gpu()],
             ),
+            ":smoke_cu13_glm5x",
         ],
         tags = ["manual"],
     )
