@@ -401,6 +401,26 @@ public:
         }
     }
 
+    void reportQuarantineEvent(bool is_write, StorageQuarantineReason reason, size_t block_count) const noexcept {
+        RtpLLMRemoteCacheQuarantineEventMetricsCollector collector;
+        collector.op          = is_write ? "write" : "read";
+        collector.block_count = static_cast<int64_t>(block_count);
+        switch (reason) {
+            case StorageQuarantineReason::SDK_TIMEOUT:
+                collector.reason = "sdk_timeout";
+                break;
+            case StorageQuarantineReason::RPC_TIMEOUT:
+                collector.reason = "rpc_timeout";
+                break;
+            case StorageQuarantineReason::RPC_ERROR:
+                collector.reason = "rpc_error";
+                break;
+            case StorageQuarantineReason::INVALID_RESPONSE:
+                collector.reason = "invalid_response";
+                break;
+        }
+        reportRemoteMetrics<RtpLLMRemoteCacheQuarantineMetrics>(collector);
+    }
 
     void reportQuarantineState(uint64_t generation, size_t task_count, size_t block_count) noexcept {
         reportQuarantineMetrics(generation, task_count, block_count);
@@ -702,21 +722,25 @@ private:
             const auto completion = result->waitForCompletion();
             if (!completion.ok()) {
                 if (result->deadlineExceeded()) {
-                    throw StorageOperationTimeout("KVCM broadcast timed out: " + completion.ToString());
+                    throw StorageOperationTimeout("KVCM broadcast timed out: " + completion.ToString(),
+                                                  StorageQuarantineReason::RPC_TIMEOUT);
                 }
                 throw StorageOperationCompletionUnknown("KVCM broadcast completion is unknown: "
-                                                            + completion.ToString());
+                                                            + completion.ToString(),
+                                                        StorageQuarantineReason::RPC_ERROR);
             }
             responses = result->responses();
         }
 
         if (responses.size() != requests.size()) {
-            throw StorageOperationCompletionUnknown("KVCM worker response count mismatch");
+            throw StorageOperationCompletionUnknown("KVCM worker response count mismatch",
+                                                    StorageQuarantineReason::INVALID_RESPONSE);
         }
         bool failed = false;
         for (const auto& response : responses) {
             if (!response.has_remote_response()) {
-                throw StorageOperationCompletionUnknown("KVCM worker returned no transfer response");
+                throw StorageOperationCompletionUnknown("KVCM worker returned no transfer response",
+                                                        StorageQuarantineReason::INVALID_RESPONSE);
             }
             switch (response.remote_response().transfer_status()) {
                 case REMOTE_TRANSFER_STATUS_UNSPECIFIED:  // successful legacy worker
@@ -726,9 +750,10 @@ private:
                     failed = true;
                     break;
                 case REMOTE_TRANSFER_STATUS_TIMEOUT:
-                    throw StorageOperationTimeout("KVCM transfer timed out");
+                    throw StorageOperationTimeout("KVCM transfer timed out", StorageQuarantineReason::SDK_TIMEOUT);
                 default:
-                    throw StorageOperationCompletionUnknown("KVCM transfer completion is unknown");
+                    throw StorageOperationCompletionUnknown("KVCM transfer completion is unknown",
+                                                            StorageQuarantineReason::INVALID_RESPONSE);
             }
         }
         if (failed) {
@@ -833,6 +858,9 @@ void KVCMStorageBackend::shutdownImpl() noexcept {
     impl_->shutdown();
 }
 
+void KVCMStorageBackend::onQuarantined(bool is_write, StorageQuarantineReason reason, size_t block_count) noexcept {
+    impl_->reportQuarantineEvent(is_write, reason, block_count);
+}
 
 void KVCMStorageBackend::onQuarantineChanged(uint64_t generation, size_t task_count, size_t block_count) noexcept {
     impl_->reportQuarantineState(generation, task_count, block_count);
