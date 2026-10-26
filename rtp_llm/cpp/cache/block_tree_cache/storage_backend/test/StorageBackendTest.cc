@@ -361,7 +361,9 @@ protected:
         match_entered_ = true;
         cv_.notify_all();
         cv_.wait(lock, [this] { return match_released_; });
-        return {request.handles.size(), nullptr};
+        StorageMatchResult result;
+        result.matched_blocks_num = request.handles.size();
+        return result;
     }
 
     void readImpl(const StorageRequest&, const std::shared_ptr<StorageBackendMatchMeta>&) override {
@@ -619,10 +621,11 @@ TEST(StorageBackendTest, DefaultExecutorShutdownSettlesQueuedOperationsAndPins) 
     auto completions = std::make_shared<std::atomic<size_t>>(0);
     backend->blockMatch();
     ASSERT_TRUE(initBackend(*backend, pool));
-    backend->match(makeRequest(NULL_BLOCK_IDX), [completions](size_t, auto, bool success) {
-        EXPECT_TRUE(success);
-        completions->fetch_add(1);
-    });
+    backend->match(makeRequest(NULL_BLOCK_IDX),
+                   [completions](size_t, auto, bool success) {
+                       EXPECT_TRUE(success);
+                       completions->fetch_add(1);
+                   });
     if (!backend->waitUntilMatchEntered()) {
         backend->releaseMatch();
         FAIL() << "match did not occupy the worker";
@@ -738,7 +741,8 @@ TEST(StorageBackendTest, IoExceptionsPropagateFailureAndReleasePins) {
 
     backend.failNextMatch();
     bool match_success = true;
-    backend.match(makeRequest(NULL_BLOCK_IDX), [&](size_t, auto, bool success) { match_success = success; });
+    backend.match(makeRequest(NULL_BLOCK_IDX),
+                  [&](size_t, auto, bool success) { match_success = success; });
     EXPECT_EQ(executor->runAll(), 1u);
     EXPECT_FALSE(match_success);
     pool->decRef(block);
@@ -806,7 +810,9 @@ TEST(StorageBackendTest, AsyncWriteDuringStoppingIsRejectedAndReleasesPins) {
     auto backend  = std::make_shared<TestBackend>(/*init_result=*/true, executor);
     backend->blockMatch();
     ASSERT_TRUE(initBackend(*backend, pool));
-    backend->match(makeRequest(NULL_BLOCK_IDX), [](size_t, auto, bool success) { EXPECT_TRUE(success); });
+    backend->match(makeRequest(NULL_BLOCK_IDX), [](size_t, auto, bool success) {
+        EXPECT_TRUE(success);
+    });
 
     BoundedThread<void> shutdown([backend] { backend->shutdown(); });
     if (!backend->waitUntilMatchEntered()) {
@@ -858,7 +864,8 @@ TEST(StorageBackendTest, AsyncWriteFromOwnCallbacksQueuesWithoutBlocking) {
         if (read) {
             backend.read(makeRequest(block), nullptr, done);
         } else {
-            backend.match(makeRequest(NULL_BLOCK_IDX), [&](size_t, auto, bool success) { done(success); });
+            backend.match(makeRequest(NULL_BLOCK_IDX),
+                          [&](size_t, auto, bool success) { done(success); });
         }
         ASSERT_TRUE(executor->runNext());
         EXPECT_TRUE(called);
@@ -901,7 +908,8 @@ TEST(StorageBackendTest, ShutdownDrainsAcceptedTasksAndRejectsNewOnes) {
     ASSERT_TRUE(initBackend(backend, pool));
 
     std::atomic<bool> completed{false};
-    backend.match(makeRequest(NULL_BLOCK_IDX), [&](size_t, auto, bool success) { completed.store(success); });
+    backend.match(makeRequest(NULL_BLOCK_IDX),
+                  [&](size_t, auto, bool success) { completed.store(success); });
     ASSERT_EQ(executor->pendingCount(), 1u);
 
     auto shutdown = std::async(std::launch::async, [&] { backend.shutdown(); });

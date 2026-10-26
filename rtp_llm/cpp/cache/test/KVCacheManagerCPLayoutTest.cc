@@ -280,10 +280,9 @@ TEST_F(KVCacheManagerCPLayoutTest, TheoryWindowSnapshotPreservesPerBatchTailAndC
     }
 }
 
-// Partial tails may be allocated as live KV blocks before they become cacheable
-// full blocks. CP invariants must therefore be based on logical sequence length,
-// not cacheKeys().size().
-TEST_F(KVCacheManagerCPLayoutTest, CPShardedMallocAllowsPartialTailWithoutCacheKey) {
+// Partial tails retain a runtime key for P/D handoff, but are not cacheable
+// full blocks. CP allocation follows logical sequence length, not key count.
+TEST_F(KVCacheManagerCPLayoutTest, CPShardedMallocTracksPartialTailKeyWithoutExtraBlock) {
     const int seq_size_per_block = 4;
     auto      config             = makeTestConfig(/*block_num=*/20, seq_size_per_block);
 
@@ -314,7 +313,8 @@ TEST_F(KVCacheManagerCPLayoutTest, CPShardedMallocAllowsPartialTailWithoutCacheK
     result = mgr->malloc(info);
     ASSERT_TRUE(result.success);
     EXPECT_EQ(resource->blocksNum(0, "default"), 1);
-    EXPECT_EQ(resource->cacheKeys(0).size(), 0);
+    EXPECT_EQ(resource->cacheKeys(0).size(), 1);
+    EXPECT_FALSE(resource->lastBlockAligned());
 }
 
 // malloc() uses the immutable global request snapshot and cache-owned storage mapping.

@@ -627,24 +627,41 @@ TEST_F(HybridPoolCoordinatorCacheManagerTest, RecomputePreservesCompactCpReadyPr
         const int device_ready_reuse_length = context.seq_size_per_block * cp_size;
         for (const std::string tag : {"swa_kv", "csa_state"}) {
             SCOPED_TRACE(tag);
-            const auto  desc = makeDsv4Desc(tag, "state", 4, DataType::TYPE_FP32);
-            const auto  spec = SpecBuilder::build(desc, context);
+            const auto desc        = makeDsv4Desc(tag, "state", 4, DataType::TYPE_FP32);
+            const auto descriptors = std::vector<std::vector<KVCacheSpecDesc>>{{desc}};
+            const auto state_layouts = FixedStateCacheSpec::resolveEntryLayouts(descriptors,
+                                                                                 parallelism,
+                                                                                 context.seq_size_per_block,
+                                                                                 context.gen_num_per_cycle,
+                                                                                 context.kernel_tokens_per_block);
+            const auto swa_layouts = FixedStateCacheSpec::resolveSwaByteLayouts(descriptors,
+                                                                                parallelism,
+                                                                                context.seq_size_per_block,
+                                                                                context.gen_num_per_cycle,
+                                                                                context.kernel_tokens_per_block);
+            const RequiredSpecProjectionTags required_tags{tag};
+            auto resolved_context = context;
+            resolved_context.state_entry_layouts           = &state_layouts;
+            resolved_context.swa_byte_layouts              = &swa_layouts;
+            resolved_context.required_spec_projection_tags = &required_tags;
+            const auto spec = SpecBuilder::build(desc, resolved_context);
             CacheConfig config;
-            config.dtype     = context.dtype;
-            config.layer_num = 1;
-            config.seq_size_per_block               = context.seq_size_per_block;
-            config.fromGroupedSpecs({spec}, {{0}}, {CacheGroupType::SWA}, {tag}, {SpecBuilder::groupPolicy(desc)});
+            config.dtype              = context.dtype;
+            config.layer_num          = 1;
+            config.seq_size_per_block = context.seq_size_per_block;
+            auto policy       = SpecBuilder::groupPolicy(desc);
+            policy.cp_mapping = CpBlockMappingMode::COMPACT_LAST_RANK;
+            config.fromGroupedSpecs({spec}, {{0}}, {CacheGroupType::SWA}, {tag}, {policy});
             config.setGroupBlockLayout({tag}, {8}, {spec->block_size_bytes()}, {0});
+            config.finalizeStorageLayout(parallelism);
             ASSERT_EQ(config.group(tag).seqSizePerBlock(), device_ready_reuse_length);
-            auto mapper = std::make_shared<CPSlotMapper>(0, cp_size, context.seq_size_per_block);
-            ASSERT_TRUE(mapper->compactLastRankGroup(config, tag));
             auto allocator = makeAllocator(config, RoleType::PREFILL);
             ASSERT_TRUE(allocator->init());
-            allocator->setCPSlotMapper(mapper);
             auto       resource = makeBatchResource(1, config);
             auto       tokens   = makeCompleteTokenIds(1, 2 * device_ready_reuse_length, context.seq_size_per_block);
             MallocInfo malloc_info{resource, tokens};
             malloc_info.enable_cache_lookup = false;
+            malloc_info.request_layout      = snapshotGlobalCacheRequest(*resource, *tokens);
             ASSERT_TRUE(allocator->malloc(malloc_info).success);
             const auto original = resource->blocks(0, tag);
             ASSERT_EQ(original.size(), 2u);

@@ -474,6 +474,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
     py::class_<KVCacheConfig>(m, "KVCacheConfig")
         .def(py::init<>())
         .def_readwrite("reuse_cache", &KVCacheConfig::reuse_cache)
+        .def_readwrite("enable_prefill_partial_tail_reuse", &KVCacheConfig::enable_prefill_partial_tail_reuse)
         .def_readwrite("enable_remote_cache", &KVCacheConfig::enable_remote_cache)
         .def_readwrite("enable_device_cache", &KVCacheConfig::enable_device_cache)
         .def_readwrite("enable_crc", &KVCacheConfig::enable_crc)
@@ -575,7 +576,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def(py::pickle(
             [](const KVCacheConfig& self) {
                 return py::make_tuple(std::string("KVCacheConfig"),
-                                      8,
+                                      10,
                                       self.reuse_cache,
                                       self.multi_task_prompt,
                                       self.multi_task_prompt_str,
@@ -643,9 +644,17 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.kv_cache_event_instance_group,
                                       self.kv_cache_event_instance_id,
                                       self.kv_cache_event_host_ip_port,
-                                      self.enable_crc);
+                                      self.enable_crc,
+                                      self.enable_prefill_partial_tail_reuse);
             },
             [](py::tuple t) {
+                const bool has_tail_field =
+                    t.size() == 71 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 10;
+                const bool enable_prefill_partial_tail_reuse = has_tail_field ? t[70].cast<bool>() : false;
+                if (has_tail_field) {
+                    t    = t[py::slice(0, 70, 1)].cast<py::tuple>();
+                    t[1] = py::int_(8);
+                }
                 const py::tuple crc_state = t;
                 const bool has_crc_field  = t.size() == 70 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 8;
                 if (has_crc_field) {
@@ -764,6 +773,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                 if (has_crc_field) {
                     c.enable_crc = crc_state[69].cast<bool>();
                 }
+                c.enable_prefill_partial_tail_reuse = enable_prefill_partial_tail_reuse;
                 return c;
             }));
 
@@ -1905,14 +1915,17 @@ PYBIND11_MODULE(libth_transformer_config, m) {
     py::class_<CacheReusePolicyDesc>(m, "CacheReusePolicyDesc")
         .def(py::init<>())
         .def_readwrite("enable_prefix_reuse", &CacheReusePolicyDesc::enable_prefix_reuse)
-        .def(py::pickle([](const CacheReusePolicyDesc& self) { return py::make_tuple(self.enable_prefix_reuse); },
-                        [](py::tuple t) {
-                            CacheReusePolicyDesc c;
-                            if (t.size() != 1)
-                                throw std::runtime_error("Invalid CacheReusePolicyDesc state!");
-                            c.enable_prefix_reuse = t[0].cast<std::optional<bool>>();
-                            return c;
-                        }));
+        .def_readwrite("local_only_state", &CacheReusePolicyDesc::local_only_state)
+        .def(py::pickle(
+            [](const CacheReusePolicyDesc& self) { return py::make_tuple(self.enable_prefix_reuse, self.local_only_state); },
+            [](py::tuple t) {
+                CacheReusePolicyDesc c;
+                if (t.size() != 2)
+                    throw std::runtime_error("Invalid CacheReusePolicyDesc state!");
+                c.enable_prefix_reuse = t[0].cast<std::optional<bool>>();
+                c.local_only_state    = t[1].cast<std::optional<bool>>();
+                return c;
+            }));
 
     py::class_<CacheCapacityPolicyDesc>(m, "CacheCapacityPolicyDesc")
         .def(py::init<>())

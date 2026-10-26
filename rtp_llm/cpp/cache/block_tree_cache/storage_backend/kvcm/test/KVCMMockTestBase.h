@@ -423,7 +423,9 @@ environmentBuffers(const BackendEnvironment& environment, int layer, const std::
     auto future  = promise->get_future();
     backend.match(
         std::move(request),
-        [promise](size_t matched_blocks_num, std::shared_ptr<StorageBackendMatchMeta> match_meta, bool success) {
+        [promise](size_t matched_blocks_num,
+                  std::shared_ptr<StorageBackendMatchMeta> match_meta,
+                  bool success) {
             promise->set_value({matched_blocks_num, std::move(match_meta), success});
         });
     return await(future);
