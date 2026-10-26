@@ -71,13 +71,15 @@ protected:
 
     std::shared_ptr<FIFOScheduler> createScheduler(size_t   max_generate_batch_size     = 100,
                                                    size_t   max_inited_kv_cache_streams = 0,
-                                                   RoleType role                        = RoleType::PDFUSION) {
+                                                   RoleType role                        = RoleType::PDFUSION,
+                                                   int      prefill_chunk_size          = 0) {
         ModelConfig model_config;
         model_config.max_seq_len = 8192;
         RuntimeConfig runtime_config;
         runtime_config.max_generate_batch_size                           = max_generate_batch_size;
         runtime_config.fifo_scheduler_config.max_batch_tokens_size       = 8192;
         runtime_config.fifo_scheduler_config.max_inited_kv_cache_streams = max_inited_kv_cache_streams;
+        runtime_config.fifo_scheduler_config.prefill_chunk_size          = prefill_chunk_size;
         PDSepConfig pd_sep_config;
         pd_sep_config.role_type = role;
         ParallelismConfig   parallelism_config;
@@ -166,6 +168,9 @@ protected:
         }));
         ON_CALL(*mock_allocator_, maxAvailableTokensNum()).WillByDefault(testing::Invoke([this]() {
             return real_allocator_->maxAvailableTokensNum();
+        }));
+        ON_CALL(*mock_allocator_, availableBlocksNum()).WillByDefault(testing::Invoke([this]() {
+            return real_allocator_->availableBlocksNum();
         }));
 
         cache_manager_->coordinator_manager_ = mock_allocator_;
@@ -1038,6 +1043,73 @@ TEST_F(FIFOSchedulerAsyncCacheTest, AsyncPrepareDoesNotSpinOnRetryableShortage) 
     ASSERT_TRUE(waitForCache([&] { return first->hasEvent(StreamEvents::CachePrepared); }));
     ASSERT_TRUE(scheduler->schedule().ok());
     EXPECT_EQ(first->getStatus(), StreamState::FINISHED);
+}
+
+TEST_F(FIFOSchedulerAsyncCacheTest, AsyncPrepareRetriesCapacityReleasedDuringFailedAllocation) {
+    autil::EnvGuard flag("RTP_LLM_ASYNC_PREPARE_CACHE", "1");
+    auto            held = createStream(std::vector<int>(10, 9));
+    ASSERT_TRUE(held->initKVBlock().ok());
+    installReadinessAllocator([](const MallocInfo&) { return nullptr; });
+    ON_CALL(*mock_allocator_, initMallocForCommonLen(testing::_))
+        .WillByDefault(testing::Invoke([&](const MallocInfo& info) {
+            if (++initial_malloc_calls_ == 1) {
+                held->releaseResource();
+                return MallocResult{false, 0, 0, MallocStatus::RETRYABLE_RESOURCE_EXHAUSTED};
+            }
+            return real_allocator_->initMallocForCommonLen(info);
+        }));
+    auto scheduler = createScheduler(1);
+    auto stream    = createStream({1, 2});
+    ASSERT_TRUE(scheduler->enqueue(stream).ok());
+    ASSERT_TRUE(waitForCache([&] { return stream->hasEvent(StreamEvents::CachePrepared); }));
+    EXPECT_EQ(initial_malloc_calls_.load(), 2);
+    auto batch = scheduler->schedule();
+    ASSERT_TRUE(batch.ok());
+    ASSERT_EQ(batch->size(), 1);
+    EXPECT_EQ(batch->front(), stream);
+}
+
+TEST_F(FIFOSchedulerAsyncCacheTest, AsyncPreparePreservesGlobalChunkBudgetAndInitialReuse) {
+    autil::EnvGuard flag("RTP_LLM_ASYNC_PREPARE_CACHE", "1");
+    installReadinessAllocator([](const MallocInfo&) { return nullptr; });
+    auto scheduler = createScheduler(2, 0, RoleType::PDFUSION, 4);
+    auto stream    = createStream({1, 2, 3, 4, 5, 6});
+    stream->setChunkSize(4);
+    ASSERT_TRUE(scheduler->enqueue(stream).ok());
+    ASSERT_TRUE(waitForCache([&] { return stream->hasEvent(StreamEvents::CachePrepared); }));
+    auto first = scheduler->schedule();
+    ASSERT_TRUE(first.ok());
+    ASSERT_EQ(first->size(), 1);
+    EXPECT_EQ(first->front(), stream);
+    EXPECT_EQ(stream->contextLength(), 4);
+    EXPECT_TRUE(stream->isMiddleChunk());
+    stream->advanceChunk();
+    auto second = scheduler->schedule();
+    ASSERT_TRUE(second.ok());
+    ASSERT_EQ(second->size(), 1);
+    EXPECT_EQ(second->front(), stream);
+    EXPECT_EQ(stream->contextLength(), 2);
+    EXPECT_FALSE(stream->isMiddleChunk());
+    EXPECT_EQ(stream->initialReuseLength(), 0);
+    EXPECT_EQ(stream->synchronizedPrefixLength(), 4);
+    EXPECT_EQ(initial_malloc_calls_.load(), 1);
+}
+
+TEST_F(FIFOSchedulerAsyncCacheTest, AsyncPrepareTimesOutWhileCapacityIsUnchanged) {
+    autil::EnvGuard flag("RTP_LLM_ASYNC_PREPARE_CACHE", "1");
+    installRetryableAllocator();
+    auto scheduler                       = createScheduler(1);
+    auto stream                          = createStream({1, 2});
+    stream->generateConfig()->timeout_ms = 100;
+    stream->resetBeginTime(autil::TimeUtility::currentTimeInMicroSeconds());
+    ASSERT_TRUE(scheduler->enqueue(stream).ok());
+    ASSERT_TRUE(waitForCache([&] { return initial_malloc_calls_.load() == 1; }));
+    ASSERT_TRUE(waitForCache([&] { return stream->hasEvent(StreamEvents::CachePrepared); }));
+    EXPECT_TRUE(stream->hasError());
+    EXPECT_EQ(initial_malloc_calls_.load(), 1);
+    ASSERT_TRUE(scheduler->schedule().ok());
+    EXPECT_EQ(stream->getStatus(), StreamState::FINISHED);
+    EXPECT_TRUE(stream->streamCacheResource().isResourceReleased());
 }
 
 TEST_F(FIFOSchedulerAsyncCacheTest, AsyncPrepareStopJoinsWorkerAndReleasesPendingLoads) {

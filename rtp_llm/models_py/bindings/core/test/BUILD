@@ -6,6 +6,24 @@ test_copts = [
 ] + copts()
 
 cc_test(
+    name = "gpu_block_copy_test",
+    srcs = ["GpuBlockCopyTest.cc"],
+    deps = [
+        "//rtp_llm/models_py/bindings/core:gpu_block_copy",
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cudart",
+        "@com_google_googletest//:gtest_main",
+    ] + torch_deps(),
+    copts = copts(),
+    target_compatible_with = select({
+        "@//:using_cuda": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
+)
+
+cc_test(
     name = "generic_sampler_batch_fallback_test",
     srcs = ["GenericSamplerBatchFallbackTest.cc"],
     deps = [
@@ -56,8 +74,8 @@ cc_test(
     args = ["--gtest_filter=" + cache_store_test_filter],
     deps = exec_ops_test_deps,
     copts = test_copts,
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 # Run the packed-mask boundary cases against the production CUDA kernel in
@@ -68,8 +86,8 @@ cc_test(
     args = ["--gtest_filter=" + packed_mask_logits_test_filter],
     deps = exec_ops_test_deps,
     copts = test_copts,
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 # Exercise the CPU fallback without initializing or allocating a GPU.
@@ -82,8 +100,8 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ] + torch_deps(),
     copts = test_copts,
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 cc_test(

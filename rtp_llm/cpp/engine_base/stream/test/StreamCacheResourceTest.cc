@@ -305,6 +305,22 @@ protected:
             const GroupSetPtr& group = cache->groupSets().front();
             const BlockIdxType block = group->allocateSingleBlock(Tier::HOST, BlockTreeRefType::CACHE);
             RTP_LLM_CHECK(!isNullBlockIdx(block));
+            // Seed through the production store so the record has the integrity
+            // footer required by this build before it is published in the tree.
+            BlockIndicesType device_blocks;
+            for (const auto& pool : group->devicePools()) {
+                const auto allocated = pool->malloc(1);
+                RTP_LLM_CHECK(allocated.has_value());
+                pool->incRef(*allocated);
+                device_blocks.push_back(allocated->front());
+            }
+            const bool stored = cache->executeTransfer(
+                TransferTask({TransferDescriptor::deviceToHost(group->groupSetId(), device_blocks, block)},
+                             std::chrono::seconds(30))).ok();
+            for (size_t member = 0; member < device_blocks.size(); ++member) {
+                group->devicePools()[member]->decRef(device_blocks[member]);
+            }
+            RTP_LLM_CHECK(stored);
             std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(1));
             resources[0][0].host_block = block;
             RTP_LLM_CHECK(cache->tree()
@@ -559,6 +575,13 @@ TEST_F(StreamCacheResourceTest, testStreamCacheResourceReuseCacheMethod) {
     stream_->generate_input_->generate_config->reuse_cache = true;
     ASSERT_TRUE(resource.reuseCache());
 
+    // prefill-only makes reuse ineffective without mutating the requested setting
+    stream_->generate_input_->generate_config->max_new_tokens = 0;
+    ASSERT_TRUE(stream_->generate_input_->generate_config->reuse_cache);
+    ASSERT_FALSE(resource.reuseCache());
+    stream_->generate_input_->generate_config->max_new_tokens = 1;
+    ASSERT_TRUE(resource.reuseCache());
+
     // engine=true, query=false -> false
     stream_->generate_input_->generate_config->reuse_cache = false;
     ASSERT_FALSE(resource.reuseCache());
@@ -571,6 +594,54 @@ TEST_F(StreamCacheResourceTest, testStreamCacheResourceReuseCacheMethod) {
     // engine=false, query=false -> false
     stream_->generate_input_->generate_config->reuse_cache = false;
     ASSERT_FALSE(resource.reuseCache());
+}
+
+TEST_F(StreamCacheResourceTest, testPrefillOnlyDisablesPrefixAndDeviceCacheReuseForAllocation) {
+    for (const bool ignore_request_switches : {false, true}) {
+        SCOPED_TRACE(ignore_request_switches);
+        prepareResource(/*reuse_cache=*/true);
+        auto& resource = stream_->streamCacheResource();
+
+        stream_->generateConfig()->max_new_tokens                = 0;
+        stream_->generateConfig()->num_return_sequences          = 1;
+        stream_->generateConfig()->reuse_cache                   = true;
+        resource.resource_context_.ignore_request_cache_switches = ignore_request_switches;
+        resource.resource_context_.enable_device_cache           = true;
+        resource.resource_context_.enable_memory_cache           = true;
+        resource.resource_context_.enable_disk_cache             = true;
+        resource.resource_context_.enable_remote_cache           = true;
+
+        const auto real_allocator = cache_manager_->coordinator_manager_;
+        auto allocator = std::make_shared<testing::NiceMock<MockCoordinatorCacheManager>>(cache_manager_->config_);
+        cache_manager_->coordinator_manager_ = allocator;
+        EXPECT_CALL(*allocator, initMallocForCommonLen(testing::_))
+            .WillOnce(testing::Invoke([real_allocator](const MallocInfo& info) {
+                EXPECT_FALSE(info.reuse_cache);
+                EXPECT_FALSE(info.enable_cache_lookup);
+                return real_allocator->initMallocForCommonLen(info);
+            }));
+        EXPECT_CALL(*allocator, incrMalloc(testing::_))
+            .Times(2)
+            .WillRepeatedly(testing::Invoke([real_allocator](const MallocInfo& info) {
+                EXPECT_FALSE(info.reuse_cache);
+                EXPECT_FALSE(info.enable_cache_lookup);
+                return real_allocator->incrMalloc(info);
+            }));
+
+        const auto init_status = resource.initKVBlock();
+        EXPECT_TRUE(init_status.ok()) << init_status;
+        EXPECT_GT(resource.curBlocksNum(), 0);
+        EXPECT_TRUE(resource.incrKVBlock().ok());
+        EXPECT_FALSE(resource.asyncLoadCache());
+        EXPECT_TRUE(resource.waitForAllocatorLoad().ok());
+        EXPECT_EQ(resource.allocator_load_context_, nullptr);
+        EXPECT_EQ(stream_->reuseLength(), 0);
+        EXPECT_EQ(resource.storeTarget(), Tier::NONE);
+        EXPECT_TRUE(stream_->generateConfig()->reuse_cache);
+        cache_manager_->coordinator_manager_ = real_allocator;
+        stream_->releaseResource();
+        EXPECT_EQ(cache_manager_->freeBlocksNum(), 8u);
+    }
 }
 
 TEST_F(StreamCacheResourceTest, testReuseCacheIgnoresPerRequestSwitchWhenConfigured) {
@@ -752,6 +823,53 @@ TEST_F(StreamCacheResourceTest, testDecodeInitKVBlock_DisablesDeviceCacheOnlyFor
     ASSERT_TRUE(resource.incrKVBlock().ok());
 }
 
+TEST_F(StreamCacheResourceTest, testPrefillOnlySkipsBlockTreeLoadsAndStores) {
+    for (const bool ignore_request_switches : {false, true}) {
+        for (const bool seed_host : {false, true}) {
+            SCOPED_TRACE("ignore=" + std::to_string(ignore_request_switches) + " host=" + std::to_string(seed_host));
+            auto  backend                = prepareStorageBackendResource(/*block_matches=*/false, seed_host);
+            auto& resource               = stream_->streamCacheResource();
+            auto  config                 = stream_->generateConfig();
+            config->max_new_tokens       = 0;
+            config->num_return_sequences = 1;
+            config->reuse_cache          = true;
+            resource.resource_context_.ignore_request_cache_switches = ignore_request_switches;
+            resource.resource_context_.enable_memory_cache           = true;
+            resource.resource_context_.enable_disk_cache             = true;
+
+            ASSERT_TRUE(resource.initKVBlock().ok());
+            ASSERT_GT(resource.curBlocksNum(), 0);
+            EXPECT_FALSE(resource.asyncLoadCache());
+            EXPECT_TRUE(resource.waitForAllocatorLoad().ok());
+            EXPECT_EQ(resource.allocator_load_context_, nullptr);
+            EXPECT_EQ(stream_->reuseLength(), 0);
+            EXPECT_EQ(stream_->hostReuseLength(), 0);
+            EXPECT_EQ(stream_->diskReuseLength(), 0);
+            EXPECT_EQ(stream_->remoteReuseLength(), 0);
+            EXPECT_EQ(backend->matchCalls(), 0u);
+
+            const auto real_allocator = cache_manager_->coordinator_manager_;
+            auto allocator = std::make_shared<testing::NiceMock<MockCoordinatorCacheManager>>(cache_manager_->config_);
+            EXPECT_CALL(*allocator, insertIntoCache(testing::_, testing::_)).Times(0);
+            EXPECT_CALL(*allocator, free(testing::_)).WillOnce(testing::Invoke([real_allocator](const FreeInfo& info) {
+                real_allocator->free(info);
+            }));
+            cache_manager_->coordinator_manager_ = allocator;
+            stream_->generate_status_->status    = StreamState::FINISHED;
+            stream_->fillSubGenerateStatus(StreamState::FINISHED);
+            stream_->releaseResource();
+            cache_manager_->coordinator_manager_ = real_allocator;
+            backend->shutdown();
+
+            EXPECT_TRUE(resource.isResourceReleased());
+            EXPECT_EQ(resource.curBlocksNum(), 0);
+            EXPECT_EQ(cache_manager_->freeBlocksNum(), 8u);
+            EXPECT_EQ(backend->writeCalls(), 0u);
+            EXPECT_TRUE(config->reuse_cache);
+        }
+    }
+}
+
 TEST_F(StreamCacheResourceTest, testAsyncLoadCache_WithoutAllocatorContext_ReturnsFalse) {
     prepareResource(/*reuse_cache=*/false);
     auto& resource = stream_->streamCacheResource();
@@ -768,16 +886,38 @@ TEST_F(StreamCacheResourceTest, testLoadCacheDone_NoContext_ReturnsTrue) {
     ASSERT_TRUE(resource.loadCacheDone());
 }
 
-TEST_F(StreamCacheResourceTest, CacheReuseMetricsAllowMissingWarmupCacheManager) {
+TEST_F(StreamCacheResourceTest, CacheReuseMetricsSkipWarmupWithoutReporter) {
     prepareResource(/*reuse_cache=*/true);
-    auto&                 resource = stream_->streamCacheResource();
-    kmonitor::MetricsTags tags;
-    stream_->setMetricsReporter(std::make_shared<kmonitor::MetricsReporter>("", "", tags));
+    auto& resource = stream_->streamCacheResource();
+    stream_->setMetricsReporter(nullptr);
     resource.resource_context_.cache_manager.reset();
 
     resource.reportCacheReuseMetrics();
 
     EXPECT_FALSE(resource.cache_reuse_metrics_.report_reuse_metrics);
+}
+
+TEST_F(StreamCacheResourceTest, CacheReuseMetricsReportWithoutCacheManager) {
+    prepareResourceWithInputTokens(std::vector<int>(32, 1), /*reuse_cache=*/true);
+    auto&                 resource = stream_->streamCacheResource();
+    kmonitor::MetricsTags tags;
+    stream_->setMetricsReporter(std::make_shared<kmonitor::MetricsReporter>("", "", tags));
+    resource.resource_context_.cache_manager.reset();
+    stream_->setInitialReuseLength(20);
+    stream_->setLocalReuseLength(12);
+    stream_->setHostReuseLength(4);
+    stream_->setDiskReuseLength(6);
+    stream_->setRemoteReuseLength(8);
+
+    resource.reportCacheReuseMetrics();
+
+    const auto& metrics = resource.cache_reuse_metrics_;
+    EXPECT_TRUE(metrics.report_reuse_metrics);
+    EXPECT_EQ(metrics.kv_cache_reuse_length, 20);
+    EXPECT_EQ(metrics.stream_cache_device_reuse_length, 2);
+    EXPECT_EQ(metrics.stream_cache_memory_reuse_length, 4);
+    EXPECT_EQ(metrics.stream_cache_disk_reuse_length, 6);
+    EXPECT_EQ(metrics.stream_cache_remote_reuse_length, 8);
 }
 
 TEST_F(StreamCacheResourceTest, AllocatorReuseRejectsInvalidCountsBeforePublishing) {
@@ -800,7 +940,7 @@ TEST_F(StreamCacheResourceTest, testCacheReuseMetricsKeepBlockAlignedInputLength
     StreamCacheResource& resource = stream_->streamCacheResource();
 
     ASSERT_TRUE(resource.initKVBlock().ok());
-    EXPECT_EQ(resource.cache_reuse_metrics_.block_aligned_input_length, 6);
+    EXPECT_EQ(resource.cache_reuse_metrics_.device_input_length, 6);
     EXPECT_FALSE(resource.cache_reuse_metrics_.report_load_metrics);
     EXPECT_FALSE(resource.cache_reuse_metrics_.load_attempted);
     EXPECT_TRUE(resource.cache_reuse_metrics_.report_match_to_ready_latency);
@@ -833,7 +973,7 @@ TEST_F(StreamCacheResourceTest, testCacheLoadLatencySegmentsCoverMatchToReady) {
     ASSERT_TRUE(resource.loadCacheDone());
 
     const RtpLLMCacheReuseMetricsCollector& metrics = resource.cache_reuse_metrics_;
-    EXPECT_TRUE(metrics.report_match_latency);
+    EXPECT_TRUE(metrics.report_match_cost_time);
     EXPECT_TRUE(metrics.report_load_metrics);
     EXPECT_TRUE(metrics.load_success);
     EXPECT_TRUE(metrics.load_attempted);
@@ -841,7 +981,7 @@ TEST_F(StreamCacheResourceTest, testCacheLoadLatencySegmentsCoverMatchToReady) {
     EXPECT_TRUE(metrics.report_match_to_ready_latency);
     EXPECT_EQ(metrics.load_prepare_latency_us, result.load_prepare_latency_us);
     EXPECT_GE(metrics.match_to_ready_latency_us,
-              metrics.match_latency_us + metrics.load_prepare_latency_us + metrics.load_wait_latency_us);
+              metrics.match_cost_time_us + metrics.load_prepare_latency_us + metrics.load_wait_latency_us);
 }
 
 TEST_F(StreamCacheResourceTest, testCacheLoadPrepareFailureHasNoWaitLatency) {
@@ -864,7 +1004,7 @@ TEST_F(StreamCacheResourceTest, testCacheLoadPrepareFailureHasNoWaitLatency) {
     EXPECT_FALSE(metrics.report_load_wait_latency);
     EXPECT_TRUE(metrics.report_match_to_ready_latency);
     EXPECT_EQ(metrics.load_prepare_latency_us, result.load_prepare_latency_us);
-    EXPECT_GE(metrics.match_to_ready_latency_us, metrics.match_latency_us + metrics.load_prepare_latency_us);
+    EXPECT_GE(metrics.match_to_ready_latency_us, metrics.match_cost_time_us + metrics.load_prepare_latency_us);
 }
 
 TEST_F(StreamCacheResourceTest, testCacheLoadFailureKeepsDeviceReuseMetrics) {
@@ -880,9 +1020,9 @@ TEST_F(StreamCacheResourceTest, testCacheLoadFailureKeepsDeviceReuseMetrics) {
     stream_->setLocalReuseLength(2);
     stream_->setHostReuseLength(0);
     stream_->setDiskReuseLength(0);
-    resource.cache_reuse_metrics_.block_aligned_input_length = 6;
-    resource.load_wait_begin_time_us_                        = currentTimeUs();
-    resource.malloc_begin_time_us_                           = resource.load_wait_begin_time_us_;
+    resource.cache_reuse_metrics_.device_input_length = 6;
+    resource.load_wait_begin_time_us_                 = currentTimeUs();
+    resource.malloc_begin_time_us_                    = resource.load_wait_begin_time_us_;
 
     auto load_context = makeAllocatorLoadContext(/*matched_blocks=*/1, {Tier::HOST});
     ASSERT_TRUE(load_context->completeTransfers(1, false));
@@ -900,19 +1040,11 @@ TEST_F(StreamCacheResourceTest, testCacheLoadFailureKeepsDeviceReuseMetrics) {
     resource.reportCacheReuseMetrics();
 
     const RtpLLMCacheReuseMetricsCollector& metrics = resource.cache_reuse_metrics_;
-    EXPECT_EQ(metrics.block_aligned_input_length, 6);
+    EXPECT_EQ(metrics.device_input_length, 6);
     EXPECT_EQ(metrics.kv_cache_reuse_length, 2);
-    EXPECT_EQ(metrics.device_reuse_length, 2);
-    EXPECT_EQ(metrics.host_reuse_length, 0);
-    EXPECT_EQ(metrics.disk_reuse_length, 0);
-    EXPECT_FALSE(metrics.report_hit_rates);
-    RtpLLMCacheReuseMetricsCollector hit_metrics;
-    ASSERT_TRUE(cache_manager_->collectCacheHitRates(cache_manager_->cache_hit_window_start_ + std::chrono::minutes(1),
-                                                     hit_metrics));
-    EXPECT_FLOAT_EQ(hit_metrics.kv_cache_hit_rate, 100.0f / 3.0f);
-    EXPECT_FLOAT_EQ(hit_metrics.device_hit_rate, 100.0f / 3.0f);
-    EXPECT_FLOAT_EQ(hit_metrics.host_hit_rate, 0.0f);
-    EXPECT_FLOAT_EQ(hit_metrics.disk_hit_rate, 0.0f);
+    EXPECT_EQ(metrics.stream_cache_device_reuse_length, 2);
+    EXPECT_EQ(metrics.stream_cache_memory_reuse_length, 0);
+    EXPECT_EQ(metrics.stream_cache_disk_reuse_length, 0);
     EXPECT_TRUE(metrics.report_reuse_metrics);
     EXPECT_TRUE(metrics.report_load_metrics);
     EXPECT_FALSE(metrics.load_success);
@@ -1176,6 +1308,86 @@ TEST_F(StreamCacheResourceTest, testPrefillAllocatorLoadFailureKeepsDeviceReadyR
     EXPECT_EQ(stream_->hostReuseLength(), 0);
     EXPECT_EQ(stream_->diskReuseLength(), 0);
     EXPECT_FALSE(stream_->hasError());
+}
+
+TEST_F(StreamCacheResourceTest, testPrefillLoadFailureDetachesSharedSuffix) {
+    for (bool cache_owned : {false, true}) {
+        SCOPED_TRACE(cache_owned);
+        prepareResource(/*reuse_cache=*/true, RoleType::PREFILL);
+        auto& resource = stream_->streamCacheResource();
+        ASSERT_TRUE(resource.initKVBlock().ok());
+        auto&      batch    = resource.kvCacheMutable();
+        const auto original = batch.blocks(0, "default");
+        ASSERT_EQ(original.size(), 3u);
+        const auto pool = cache_manager_->coordinator_manager_->groupBlockPools().front();
+        // Keep the device-ready prefix shared; only the writable suffix must detach.
+        pool->incTreeRef(original[0], BlockTreeRefType::CACHE);
+        if (cache_owned) {
+            pool->incTreeRef(original[1], BlockTreeRefType::CACHE);
+        } else {
+            pool->incRef(original[1]);  // Another request joined the failed load.
+        }
+        stream_->setReuseLength(2);
+        stream_->setInitialReuseLength(2);
+        stream_->setLocalReuseLength(2);
+        resource.allocator_load_context_ = std::make_shared<ImmediateAllocatorContext>(false);
+
+        ASSERT_TRUE(resource.loadCacheDone());
+        EXPECT_FALSE(stream_->hasError());
+        EXPECT_EQ(stream_->reuseLength(), 2);
+        const auto replacement = batch.blocks(0, "default")[1];
+        EXPECT_NE(replacement, original[1]);
+        for (int b = 0; b < batch.batchSize(); ++b) {
+            EXPECT_EQ(batch.blocks(b, "default")[0], original[0]);
+            EXPECT_EQ(batch.blocks(b, "default")[1], replacement);
+            EXPECT_EQ(batch.blocks(b, "default")[2], original[2]);
+            EXPECT_EQ(batch.mutableBlockIds(b, "default").kernelBlocks()[1], replacement);
+        }
+        EXPECT_EQ(pool->refCount(original[1]), 1u);
+        EXPECT_EQ(pool->refCount(replacement), batch.batchSize());
+        pool->decTreeRef(original[0], BlockTreeRefType::CACHE);
+        if (cache_owned) {
+            pool->decTreeRef(original[1], BlockTreeRefType::CACHE);
+        } else {
+            pool->decRef(original[1]);
+        }
+        stream_->releaseResource();
+        EXPECT_EQ(cache_manager_->freeBlocksNum(), 8u);
+    }
+}
+
+TEST_F(StreamCacheResourceTest, testPrefillLoadFailureDetachShortfallRearmsAllocation) {
+    prepareResource(/*reuse_cache=*/true, RoleType::PREFILL);
+    auto& resource = stream_->streamCacheResource();
+    ASSERT_TRUE(resource.initKVBlock().ok());
+    const auto blocks = resource.kvCache().blocks(0, "default");
+    const auto pool   = cache_manager_->coordinator_manager_->groupBlockPools().front();
+    pool->incTreeRef(blocks[1], BlockTreeRefType::CACHE);
+    pool->incTreeRef(blocks[2], BlockTreeRefType::CACHE);
+    // Leave room for only one of the two replacements; the batch cannot fit.
+    auto held_blocks = pool->malloc(pool->freeBlocksNum() - 1);
+    ASSERT_TRUE(held_blocks.has_value());
+    pool->incRef(*held_blocks);
+    stream_->setReuseLength(2);
+    resource.allocator_load_context_ = std::make_shared<ImmediateAllocatorContext>(false);
+    stream_->reportEvent(StreamEvents::CanRun);
+    stream_->reportEvent(StreamEvents::LoadInitiated);
+    stream_->generate_status_->status = StreamState::LOADING_CACHE;
+
+    EXPECT_EQ(stream_->moveToNext(), StreamState::WAITING);
+    EXPECT_FALSE(stream_->hasEvent(StreamEvents::LoadInitiated));
+    EXPECT_FALSE(stream_->hasError());
+    EXPECT_EQ(resource.curBlocksNum(), 0);
+    EXPECT_EQ(stream_->reuseLength(), 0);
+    EXPECT_EQ(resource.mallocFailedTimes(), 1);
+    EXPECT_EQ(pool->refCount(blocks[1]), 1u);
+    EXPECT_EQ(pool->refCount(blocks[2]), 1u);
+    EXPECT_EQ(pool->freeBlocksNum(), 2u);  // Unused free block plus released prefix.
+    pool->decRef(*held_blocks);
+    pool->decTreeRef(blocks[1], BlockTreeRefType::CACHE);
+    pool->decTreeRef(blocks[2], BlockTreeRefType::CACHE);
+    EXPECT_EQ(cache_manager_->freeBlocksNum(), 8u);
+    ASSERT_TRUE(resource.initKVBlock().ok());
 }
 
 TEST_F(StreamCacheResourceTest, testPrefillMaterializationShortfallRearmsAllocatorLoad) {

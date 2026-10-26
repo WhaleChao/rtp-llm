@@ -263,6 +263,35 @@ public:
     int64_t prefillRemoteReuseLen() const;
     int64_t prefillMemoryReuseLen() const;
 
+    // ---- chunked prefill (PREFILL / PDFUSION roles) ----
+    // reuse_length_ is the current chunk start, and advances after each middle chunk.
+    // When useChunkWindow() is true, contextLength() returns the current chunk length.
+    // initial_reuse_length_ stays frozen for cache-hit metrics.
+    void setChunkSize(int chunk_size) {
+        chunk_size_ = chunk_size;
+        max_chunk_size_ = std::max(max_chunk_size_, chunk_size);
+    }
+    int maxChunkSize() const {
+        return max_chunk_size_;
+    }
+    bool chunkedPrefillEnabled() const {
+        return chunk_size_ > 0;
+    }
+    void enableWarmupChunkWindow() {
+        warmup_chunk_window_ = true;
+    }
+    bool useChunkWindow() const;   // enabled + RUNNING/warmup + context -> window funcs return chunk view
+    int  currentChunkLen() const;  // tokens to compute in the current chunk
+    bool isLastChunk() const;      // current chunk reaches seqLength()
+    bool isMiddleChunk() const;    // chunked + context + !last → no sample / no output row
+    void advanceChunk();  // reuse_length_ += currentChunkLen()
+    int  cacheStorePublishStartToken() const {
+        return chunk_advanced_ ? prefixLength() : 0;
+    }
+    // Prompt token right after the current chunk; valid only for middle chunks.
+    // Used as speculative draft prefill tail instead of a sampled token.
+    int nextChunkBoundaryToken() const;
+
     bool                 isContextStream() const;
     const torch::Tensor& cumLogProbs() const;
 
@@ -289,6 +318,7 @@ public:
     torch::Tensor              multimodalLocations() const;
 
     int64_t getTimeoutMs() const;
+    bool    checkTimeoutAndHasError();
     void    recordWaitLatency();
     void    recordSchedulerEnqueueTime(int64_t time_us);
     void    recordCanRunTime();
@@ -350,8 +380,8 @@ public:
     virtual StreamState getStatus() const;
     bool                isFinished() const;  // Returns true if stream is finished
     // Complete a Decode stream owned by the RPC handler, before scheduler enqueue.
-    bool                finishWithoutGenerate();
-    bool                isActive() const;    // Returns true if stream is active (no error and not finished)
+    bool finishWithoutGenerate();
+    bool isActive() const;  // Returns true if stream is active (no error and not finished)
 
     // A response consumer may observe GenerateDone before the scheduler has
     // committed RUNNING -> FINISHED. Preserve that successful completion and
@@ -611,6 +641,7 @@ public:
         // carries this beside next_seq_len so MRoPE target-verify graphs can
         // be prepared without consulting worker-owned host bookkeeping.
         torch::Tensor next_position_ids_gpu;
+        torch::Tensor engram_token_window_gpu;
         torch::Tensor propose_tokens_gpu;
         // Immutable physical and logical-to-kernel page tables for the next
         // speculative round. The async worker may still be committing the
@@ -644,6 +675,10 @@ public:
         state.epoch      = ++mtp_async_epoch_counter_;
         mtp_async_state_ = std::move(state);
         return mtp_async_state_.epoch;
+    }
+    void setEngramTokenWindowGpu(torch::Tensor history) {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        mtp_async_state_.engram_token_window_gpu = std::move(history);
     }
     MtpAsyncDeviceState getMtpAsyncDeviceState() const {
         std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
@@ -737,8 +772,9 @@ public:
     // token and the committed sequence length after that token.
     struct NormalAsyncDeviceState {
         uint64_t      epoch = 0;
-        torch::Tensor last_sample_token_gpu;  // [1] int32
-        torch::Tensor next_seq_len_gpu;       // [1] int32, seqLength after sample
+        torch::Tensor last_sample_token_gpu;    // [1] int32
+        torch::Tensor next_seq_len_gpu;         // [1] int32, seqLength after sample
+        torch::Tensor engram_token_window_gpu;  // [1,4], current token first
         // Host seqLength before the sampled token represented by this state.
         // -1 = unset (first iter / cleared).
         int last_real_seq_len = -1;
@@ -791,7 +827,8 @@ public:
     }
 
     bool reuseCache() const {
-        return generate_input_->generate_config->reuse_cache;
+        const auto& config = *generate_input_->generate_config;
+        return config.reuse_cache && !config.isPrefillOnly();
     }
 
     bool enableDeviceCache() const {
@@ -860,6 +897,7 @@ protected:
 
     int                      estimateKVNeedBlocks(int remaining_tokens, int target_batch_size) const;
     bool                     reportUpdateErrorWithoutLock(const std::optional<ErrorInfo>& error_info);
+    bool prepareUpdateWithoutLock(const std::optional<ErrorInfo>& error_info, bool force_update_info);
     std::optional<ErrorInfo> updateNormalLogitProcessorStatus(const StreamUpdateInfo& update_info);
     std::optional<ErrorInfo> updateLogitProcessorStatus(const torch::Tensor& new_tokens, int32_t num_new_tokens);
     void                     updateLogitProcessorMultiSeqStatus(const torch::Tensor& src_batch_indices);
@@ -909,6 +947,12 @@ protected:
     int                                remote_reuse_length_  = 0;
     int                                host_reuse_length_    = 0;
     int                                disk_reuse_length_    = 0;
+    // Chunked prefill normally gates on RUNNING so admission-time calls keep whole-segment
+    // semantics. Prefill warmup explicitly opts in because it bypasses the scheduler.
+    int  chunk_size_          = 0;
+    int  max_chunk_size_      = 0;
+    bool chunk_advanced_      = false;
+    bool warmup_chunk_window_ = false;
     // prefill reuse info (PD-sep); read/write only under output_mutex_
     int64_t prefill_total_reuse_len_  = 0;
     int64_t prefill_local_reuse_len_  = 0;

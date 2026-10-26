@@ -4,6 +4,7 @@
 #include <exception>
 #include <mutex>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <unistd.h>
 #include <limits.h>
@@ -273,29 +274,6 @@ std::vector<size_t> DecodeRpcServer::completionQueueExpectedResponseCounts(size_
     return expected_response_counts;
 }
 
-int DecodeRpcServer::markLoadedCacheReuse(const std::shared_ptr<GenerateStream>& stream,
-                                          const LoadCacheResult&                 load_result,
-                                          int                                    seq_size_per_block,
-                                          size_t                                 group_num) {
-    if (!stream || group_num <= 1 || !load_result.ok() || load_result.loaded_cache_block_count == 0
-        || seq_size_per_block <= 0 || stream->inputLength() <= 1) {
-        return 0;
-    }
-
-    const size_t max_reusable_block_count =
-        static_cast<size_t>(stream->inputLength() - 1) / static_cast<size_t>(seq_size_per_block);
-    const size_t published_block_count = std::min(load_result.loaded_cache_block_count, max_reusable_block_count);
-    if (published_block_count == 0) {
-        return 0;
-    }
-
-    const int loaded_reuse_len = static_cast<int>(published_block_count) * seq_size_per_block;
-    stream->setInitialReuseLength(std::max(stream->initialReuseLength(), loaded_reuse_len));
-    stream->setReuseLength(std::max(stream->reuseLength(), loaded_reuse_len));
-    stream->setLocalReuseLength(std::max(stream->localReuseLength(), loaded_reuse_len));
-    return loaded_reuse_len;
-}
-
 void DecodeRpcServer::logReadFailures(int64_t                         request_id,
                                       const std::string&              peer_addr,
                                       ErrorCode                       error_code,
@@ -520,19 +498,9 @@ void DecodeRpcServer::loadCacheFromPrefill(DecodeGenerateContext& decode_context
     decode_context.time_info.updateLoadBeginTime();
     auto load_result = loadCacheForAllRank(decode_context);
     decode_context.time_info.updateLoadEndTime();
-    const auto& error_info      = load_result.error_info;
-    auto&       generate_stream = decode_context.getStream();
-    const int   loaded_reuse_len =
-        markLoadedCacheReuse(generate_stream,
-                             load_result,
-                             generate_stream->seqSizePerBlock(),
-                             generate_stream->resourceContext().cache_manager->cacheConfig().groupNums());
-    if (loaded_reuse_len > 0) {
-        RTP_LLM_LOG_DEBUG("request [%s] marked completed P/D handoff reuse_len=%d blocks=%zu",
-                          decode_context.request_key.c_str(),
-                          loaded_reuse_len,
-                          load_result.loaded_cache_block_count);
-    }
+    // KV transferred for this request is not a historical prefix-cache hit.
+    // Keep transfer accounting separate from the stream's reuse lengths.
+    const auto& error_info   = load_result.error_info;
     const auto  error_reason = error_info.ok() ? std::string() : ErrorCodeToString(error_info.code());
     const auto* error_type =
         error_info.ok() ? nullptr :
@@ -619,6 +587,13 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
                       generate_request.stage() == RemoteStage::GENERATE,
                       grpc::StatusCode::INTERNAL,
                       "message first status != RemoteStage::GENERATE");
+    if (generate_stream->generateConfig()->isPrefillOnly()) {
+        decode_context.error_info =
+            ErrorInfo(ErrorCode::INVALID_PARAMS, "prefill-only request cannot enter decode generation");
+        decode_context.error_status =
+            serializeErrorMsg(decode_context.request_key, decode_context.request_info, decode_context.error_info);
+        return;
+    }
     decode_context.time_info.updateGenerateBeginTime();
     generate_stream->setIsContextStream(false);
     generate_stream->step();
@@ -1681,6 +1656,13 @@ grpc::Status DecodeRpcServer::RemoteGenerate(grpc::ServerContext* server_context
         EXECUTE_STAGE_FUNC(loadCacheFromPrefill, decode_context);
         EXECUTE_STAGE_FUNC(localGenerate, decode_context);
         decode_context.stat_info.nextStage();
+    } catch (const std::invalid_argument& e) {
+        auto error_msg = "request [" + decode_context.request_key + "] catch invalid argument [" + e.what() + "]";
+        decode_context.error_info = ErrorInfo(ErrorCode::INVALID_PARAMS, error_msg);
+        decode_context.error_status =
+            serializeErrorMsg(decode_context.request_key, decode_context.request_info, decode_context.error_info);
+        reportEarlyFinishTask(decode_context, static_cast<int64_t>(ErrorCode::INVALID_PARAMS), error_msg);
+        return decode_context.error_status;
     } catch (const std::exception& e) {
         auto error_msg              = "request [" + decode_context.request_key + "] catch exception [" + e.what() + "]";
         decode_context.error_info   = ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, error_msg);

@@ -50,6 +50,7 @@ private:
     std::mutex        cache_prepare_stop_mutex_;
     GenerateStreamPtr cache_prepare_blocked_stream_;
     size_t            cache_prepare_blocked_available_ = 0;
+    bool              cache_prepare_blocked_by_quota_  = false;
 
     using StreamGroup      = std::list<GenerateStreamPtr>;
     using StreamGroupQueue = std::list<StreamGroup>;
@@ -118,9 +119,10 @@ private:
     void dispatchPreparedGroup(StreamGroup& group);
 
     void    cancelExtraStreams() override;
-    bool    hasExtraStreams() const override;
     int64_t extraOnflightStreams() const override;
     void    fillExtraMetrics(RtpLLMSchedulerMetricsCollector& collector) const override;
+    void    appendExtraRunningTaskList(std::vector<EngineScheduleInfo::TaskInfo>& task_list) const override;
+    bool    partitionChunkContinuations();
 
     // Explicit request groups (enqueueGroup). Each group is admitted as a whole
     // to an isolated execution boundary; a partially admitted group keeps its
@@ -142,6 +144,7 @@ private:
     bool                         prefer_group_next_            = false;
 
     // TODO @wangyin support different beams run togather
+    std::list<GenerateStreamPtr> pending_decode_streams_;
 };
 
 }  // namespace rtp_llm
