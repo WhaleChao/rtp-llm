@@ -31,6 +31,8 @@ enum class ParallelMode {
 // context batch is request for initial word, decoder batch is request for incremental word.
 // ids and lengths are int32_t
 struct GptModelInputs {
+    torch::Tensor engram_token_windows;
+    torch::Tensor mm_features_spans;
     // input_lengths holds original input length for requests,
     // shape [decoder_batch_size + context_batch_size], int32
     // sequence_lengths holds current sequence length for incremental decoding requests,
@@ -45,6 +47,8 @@ struct GptModelInputs {
     // scheduling redesign no longer populates it (stays undefined).
     torch::Tensor lm_output_lengths;        // [total_batch_size]
     torch::Tensor prefix_lengths;           // [context_batch_size]
+    // First token of this request's FULL cache-store write; zero on its first chunk.
+    torch::Tensor cache_store_publish_start_tokens;  // [context_batch_size], optional
     torch::Tensor sequence_lengths_plus_1;  // optional CUDA mirror for target-verify linear attention
 
     torch::Tensor combo_tokens_type_ids;  // [cumulated_seq_len]
@@ -91,6 +95,8 @@ struct GptModelInputs {
     // CP prefill exit must materialize the full [seq, hidden] all_hidden_states
     // (true) or may gather only the last-token rows lm_head needs (false).
     bool need_all_hidden_states = false;
+    bool skip_lm_head           = false;
+    bool capture_hidden_states  = false;
     bool need_moe_gating        = false;
     bool warmup                 = false;
     bool skip_run               = false;

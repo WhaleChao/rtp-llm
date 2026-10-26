@@ -7,6 +7,7 @@ load("@pip_gpu_cuda12_9_torch//:requirements.bzl", requirement_gpu_cuda12_9 = "r
 load("@pip_gpu_cuda12_torch//:requirements.bzl", requirement_gpu_cuda12 = "requirement")
 load("@pip_gpu_cuda13_torch//:requirements.bzl", requirement_gpu_cuda13 = "requirement")
 load("@pip_gpu_rocm_torch//:requirements.bzl", requirement_gpu_rocm = "requirement")
+load("@pip_ppu_torch//:requirements.bzl", requirement_ppu = "requirement")
 load("@rtp_llm//bazel:defs.bzl", "copy_so")
 
 def copy_all_so():
@@ -24,10 +25,41 @@ _CUDA13_ARM_DEFERRED = ["flash_attn", "flash-attn-3"]
 # gracefully, so the other platforms resolve it to nothing.
 _DSV4_PLATFORM_ONLY = ["xgrammar"]
 
+# Names with no PPU wheel in the vendor lock (CUDA/ROCm-only deps, or no
+# cp312 wheel). requirement() resolves them to an empty library on PPU.
+_PPU_LOCK_SKIPPED = [
+    "aiter",
+    "amdsmi",
+    "decord",
+    "fast-safetensors",
+    "fastsafetensors",
+    "flashinfer-cubin",
+    "flashinfer-jit-cache",
+    "nvidia-cutlass-dsl",
+    "pyrsmi",
+    "rtp-kernel",
+    "tilelang",
+    "triton-kernels",
+    "xfastertransformer_devel",
+    "xfastertransformer_devel_icx",
+    "xgrammar",
+]
+
 def requirement(names):
     for name in names:
+        if name == "flash-mla-legacy":
+            native.py_library(
+                name = name,
+                deps = select({
+                    "@rtp_llm//:using_cuda13_arm": [requirement_cuda13_arm(name)],
+                    "//conditions:default": [],
+                }),
+                visibility = ["//visibility:public"],
+            )
+            continue
         cuda13_x86_deps = [] if name in _CUDA13_X86_DEFERRED else [requirement_gpu_cuda13(name)]
         cuda13_arm_deps = [] if name in _CUDA13_ARM_DEFERRED else [requirement_cuda13_arm(name)]
+        ppu_deps = [] if name in _PPU_LOCK_SKIPPED else [requirement_ppu(name)]
         if name in _DSV4_PLATFORM_ONLY:
             native.py_library(
                 name = name,
@@ -47,7 +79,7 @@ def requirement(names):
                 "@rtp_llm//:using_cuda13_x86": cuda13_x86_deps,
                 "@rtp_llm//:using_cuda12_9_x86": [requirement_gpu_cuda12_9(name)],
                 "@rtp_llm//:using_cuda13_arm": cuda13_arm_deps,
-                "@rtp_llm//:using_rocm": [requirement_gpu_rocm(name)],
+                "@rtp_llm//:using_rocm": [requirement_gpu_rocm("amd-aiter" if name == "aiter" else name)],
                 "@rtp_llm//:using_arm": [requirement_arm(name)],
                 "//conditions:default": [requirement_cpu(name)],
             }),
@@ -93,27 +125,26 @@ def whl_deps():
             "flash_attn@http://artlab.alibaba-inc.com/1/pypi/rtp_llm/flash-attn/flash_attn-2.8.3.post1%2Bcu13torch2.11cxx11abitrue.r1-cp310-cp310-linux_x86_64.whl",
             "flashinfer-python@https://artlab.alibaba-inc.com/1/pypi/rtp_llm/flashinfer-python/flashinfer_python-0.6.9+8c4f4dcf-py3-none-any.whl",
             "flashinfer-cubin@https://artlab.alibaba-inc.com/1/pypi/rtp_llm/flashinfer-cubin/flashinfer_cubin-0.6.9+8c4f4dcf-py3-none-any.whl",
-            "flashinfer-jit-cache@https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/rtp-kernel/flashinfer-ci/flashinfer_jit_cache-0.6.9%2B8c4f4dcf.cu132-cp39-abi3-manylinux_2_28_x86_64.whl",
-            "rtp-kernel@http://artlab.alibaba-inc.com/1/pypi/rtp_llm/rtp-kernel/rtp_kernel-0.1.0%2B34e3b72a.cu132-cp310-cp310-linux_x86_64.whl",
+            "rtp-kernel@http://artlab.alibaba-inc.com/1/pypi/rtp_llm/rtp-kernel/rtp_kernel-0.1.0%2B94fd20eb.cu132-cp310-cp310-linux_x86_64.whl",
             "fast-safetensors@https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/0507/fast_safetensors-0.7.3%2Btorch2.11.cu130-cp310-cp310-linux_x86_64.whl",
             "fastsafetensors@https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/0502/fastsafetensors-0.1.20%2Bali-cp310-cp310-linux_x86_64.whl",
-            "tilelang==0.1.9",
-            "apache-tvm-ffi==0.1.10",
+            "tilelang==0.1.15",
+            "apache-tvm-ffi==0.1.12",
         ],
         "@rtp_llm//:using_cuda13_arm": [
-            "torch@https://rtp-maga.cn-zhangjiakou.oss.aliyuncs.com/rtp_llm/arm_pkg/torch-2.11.0%2Bcu130-cp310-cp310-manylinux_2_28_aarch64.whl",
-            "torchvision@https://rtp-maga.cn-zhangjiakou.oss.aliyuncs.com/rtp_llm/arm_pkg/torchvision-0.26.0%2Bcu130-cp310-cp310-manylinux_2_28_aarch64.whl",
-            "deep_gemm@https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/rtp_llm/deep_gemm/cuda13_gb300/deep_gemm-2.5.0%2B6053f00-cp310-cp310-linux_aarch64.whl",
-            "flash-mla@https://rtp-maga.cn-zhangjiakou.oss.aliyuncs.com/0530/arm_pkg/sglang/flash_mla-1.0.0%2B92fd68b-cp310-cp310-linux_aarch64.whl",
+            "torch@https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/rtp_llm/arm_pkg/torch-2.11.0%2Bcu130-cp310-cp310-manylinux_2_28_aarch64.whl",
+            "torchvision@https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/rtp_llm/arm_pkg/torchvision-0.26.0%2Bcu130-cp310-cp310-manylinux_2_28_aarch64.whl",
+            "deep_gemm@https://search-ad.oss-cn-hangzhou-zmf-internal.aliyuncs.com/rtp-llm-deps/dsv41/20261009/deep_gemm-2.8.1%2B057ca59-cp310-cp310-linux_aarch64.whl",
+            "flash-mla@https://search-ad.oss-cn-hangzhou-zmf-internal.aliyuncs.com/rtp-llm-deps/dsv41/20261009/flash_mla-1.0.0%2B2e5429f-cp310-cp310-linux_aarch64.whl",
+            "flash-mla-legacy@https://search-ad.oss-cn-hangzhou-zmf-internal.aliyuncs.com/rtp-llm-deps/dsv41/20261009/flash_mla_legacy-1.0.0%2B92fd68b.rtp1-cp310-cp310-linux_aarch64.whl",
             "deep-ep@http://artlab.alibaba-inc.com/1/pypi/rtp_llm/deep-ep/deep_ep-2.1.0%2Ba56d615-2-cp310-cp310-linux_aarch64.whl",
             "flashinfer-python@https://artlab.alibaba-inc.com/1/pypi/rtp_llm/flashinfer-python/flashinfer_python-0.6.9+8c4f4dcf-py3-none-any.whl",
             "flashinfer-cubin@https://artlab.alibaba-inc.com/1/pypi/rtp_llm/flashinfer-cubin/flashinfer_cubin-0.6.9+8c4f4dcf-py3-none-any.whl",
-            "flashinfer-jit-cache@https://rtp-maga.cn-zhangjiakou.oss.aliyuncs.com/rtp-kernel/flashinfer-ci/flashinfer_jit_cache-0.6.9%2B8c4f4dcf.cu132-cp39-abi3-manylinux_2_28_aarch64.whl",
-            "rtp-kernel@http://artlab.alibaba-inc.com/1/pypi/rtp_llm/rtp-kernel/rtp_kernel-0.1.0%2B34e3b72a.cu132-cp310-cp310-linux_aarch64.whl",
-            "fast-safetensors@https://rtp-maga.cn-zhangjiakou.oss.aliyuncs.com/0513/arm_pkg/fast_safetensors-0.7.3%2Btorch2.11.cu130-cp310-cp310-linux_aarch64.whl",
-            "fastsafetensors@https://rtp-maga.cn-zhangjiakou.oss.aliyuncs.com/0513/arm_pkg/fastsafetensors-0.1.20%2Bali-cp310-cp310-linux_aarch64.whl",
-            "tilelang@https://rtp-maga.cn-zhangjiakou.oss.aliyuncs.com/rtp_llm/arm_pkg/tilelang-0.1.9%2Bcuda.git441c3b06-cp38-abi3-linux_aarch64.whl",
-            "apache-tvm-ffi==0.1.10",
+            "rtp-kernel@http://artlab.alibaba-inc.com/1/pypi/rtp_llm/rtp-kernel/rtp_kernel-0.1.0%2B94fd20eb.cu132-cp310-cp310-linux_aarch64.whl",
+            "fast-safetensors@https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/0513/arm_pkg/fast_safetensors-0.7.3%2Btorch2.11.cu130-cp310-cp310-linux_aarch64.whl",
+            "fastsafetensors@https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/0513/arm_pkg/fastsafetensors-0.1.20%2Bali-cp310-cp310-linux_aarch64.whl",
+            "tilelang@https://search-ad.oss-cn-hangzhou-zmf-internal.aliyuncs.com/rtp-llm-deps/dsv41/20261009/tilelang-0.1.15%2Bcuda.gita35f8ddf-cp39-abi3-linux_aarch64.whl",
+            "apache-tvm-ffi==0.1.12",
         ],
         "@rtp_llm//:using_cuda12": ["torch==2.6.0+cu126"],
         "@rtp_llm//:using_rocm": [
@@ -121,12 +152,34 @@ def whl_deps():
             "amdsmi@https://sinian-metrics-platform.oss-cn-hangzhou.aliyuncs.com/kis%2FAMD%2Famd_smi%2Fali%2Famd_smi.tar",
             # Keep the ROCm AITER/FlyDSL pins synchronized with
             # deps/requirements{,_lock}_rocm.txt.
-            "aiter@https://sinian-metrics-platform.oss-cn-hangzhou.aliyuncs.com/kis/AMD/aiter/aiter-0.1.21.dev80%2Bg987203ba5.d20260825-cp310-cp310-linux_x86_64.whl",
-            "flydsl==0.3.1",
-            "triton@https://sinian-metrics-platform.oss-cn-hangzhou.aliyuncs.com/kis/AMD/triton/triton-3.7.0%2Bamd.rocm7.2.0.gitd0d77a509-cp310-cp310-linux_x86_64.whl",
-            "triton-kernels@https://sinian-metrics-platform.oss-cn-hangzhou.aliyuncs.com/kis/AMD/triton/triton_kernels-1.0.0%2Bamd.rocm7.2.0.gitd0d77a509-py3-none-any.whl",
+            "amd-aiter@https://sinian-metrics-platform.oss-cn-hangzhou.aliyuncs.com/kis/AMD/aiter/amd_aiter-0.1.23.dev134%2Bg8449f416b-cp310-cp310-linux_x86_64.whl",
+            "flydsl==0.3.2",
+            "triton@https://sinian-metrics-platform.oss-cn-hangzhou.aliyuncs.com/kis/AMD/triton/triton-3.8.0%2Bamd.rocm7.2.0.git111ff227-cp310-cp310-linux_x86_64.whl",
+            "triton-kernels@https://sinian-metrics-platform.oss-cn-hangzhou.aliyuncs.com/kis/AMD/triton/triton_kernels-1.0.0%2Bamd.rocm7.2.0.git111ff227-py3-none-any.whl",
         ],
         "//conditions:default": ["torch==2.1.2"],
+    })
+
+def ml_pin_reqs():
+    """Wheel pins that diverge between the PPU vendor lock and the CUDA locks.
+
+    The PPU lock (deps/requirements_lock_torch_ppu.txt) pins the transformers
+    4.57.1 family and carries no xgrammar (its wheel chain is CUDA-only; the
+    PPU bazel deps exclude it the same way). Keep wheel metadata aligned with
+    the lock of the environment the wheel is installed into.
+    """
+    return select({
+        "@rtp_llm//:using_ppu": [
+            "transformers==4.57.1",
+            "sentence-transformers==2.7.0",
+            "pyarrow==17.0.0",
+        ],
+        "//conditions:default": [
+            "transformers==5.2.0",
+            "sentence-transformers==5.2.0",
+            "pyarrow==14.0.0",
+            "xgrammar==0.2.5",
+        ],
     })
 
 def platform_deps():
@@ -135,11 +188,22 @@ def platform_deps():
         "@rtp_llm//:using_cuda12_arm": [],
         "@rtp_llm//:using_cuda13_arm": [],
         "@rtp_llm//:using_rocm": ["pyyaml==6.0.2", "decord==0.6.0", "av==16.1.0"],
+        # decord has no cp312 wheel; PPU video input is unsupported.
+        "@rtp_llm//:using_ppu": ["av==16.1.0"],
         "//conditions:default": ["decord==0.6.0", "av==16.1.0"],
     })
 
+def cuda13_x86_test_gpu():
+    """Pool label for CUDA 13 x86 test execution.
+
+    Returned through @arch_config so builds can resolve their own pool
+    label; the default value names the SM103 machine class only.
+    """
+    return "SM103_TEST"
+
 def torch_deps():
     deps = select({
+        "@rtp_llm//:using_ppu": ["@torch_2.11_py312_ppu//:torch_api", "@torch_2.11_py312_ppu//:torch", "@torch_2.11_py312_ppu//:torch_libs"],
         "@rtp_llm//:using_rocm": [
             "@torch_rocm//:torch_api",
             "@torch_rocm//:torch",
@@ -213,24 +277,12 @@ def select_py_bindings():
         "@rtp_llm//:using_rocm": [
             "@rtp_llm//rtp_llm/models_py/bindings/rocm:rocm_bindings_register",
         ],
+        "@rtp_llm//:using_ppu": [
+            "@rtp_llm//rtp_llm/models_py/bindings/ppu:ppu_bindings_register",
+        ],
         "//conditions:default": [
             "@rtp_llm//rtp_llm/models_py/bindings:dummy_register",
         ],
-    })
-
-def cuda13_test_exec_properties(gpu_count = 1):
-    """CUDA13 tests use existing pools matching their target architecture.
-
-    Coverage map: x86 tests execute on B300 (L20D_TEST, sm_103 cubins) and on
-    A10 (A10_CU13, sm_86); ARM tests execute on GB200 (SM100_ARM_CU13, sm_100).
-    The sm_120 (x86) and sm_103 (ARM) cubins built by the configs have no
-    matching pool yet and are compiled for forward compatibility only.
-    """
-    return select({
-        "@rtp_llm//:using_cuda13_arm": {"gpu": "SM100_ARM_CU13", "gpu_count": str(gpu_count)},
-        "@rtp_llm//:using_cuda13_x86": {"gpu": "L20D_TEST", "gpu_count": str(gpu_count)},
-        "@rtp_llm//:using_cuda12_arm": {"gpu": "SM100_ARM", "gpu_count": str(gpu_count)},
-        "//conditions:default": {"gpu": "A10_CU13", "gpu_count": str(gpu_count)},
     })
 
 def no_block_copy_link_deps():
@@ -238,6 +290,9 @@ def no_block_copy_link_deps():
     return select({
         "@rtp_llm//:using_cuda12": [
             "@rtp_llm//rtp_llm/models_py/bindings/cuda:no_block_copy",
+        ],
+        "@rtp_llm//:using_ppu": [
+            "@rtp_llm//rtp_llm/models_py/bindings/ppu:no_block_copy",
         ],
         "@rtp_llm//:using_rocm": [
             "@rtp_llm//rtp_llm/models_py/bindings:no_block_copy_default",

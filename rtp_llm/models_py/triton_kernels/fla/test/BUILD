@@ -32,12 +32,21 @@ py_library(
 )
 
 py_test(
+    name = "test_pointer_boundaries",
+    srcs = ["test_pointer_boundaries.py"],
+    deps = ["//rtp_llm/models_py/triton_kernels:fla"] + [":triton", ":torch", ":einops", ":packaging"],
+    tags = ["rocm"],
+    exec_properties = {"gpu": "MI308X-ROCM7"},
+)
+
+py_test(
     name = "test_gdn_block_prefill",
     srcs = [
         "test_gdn_block_prefill.py",
     ],
     deps = [
         "//rtp_llm/models_py/triton_kernels:fla",
+        "//rtp_llm/models_py/triton_kernels:causal_conv1d",
     ] + [
         ":einops",
         ":numpy",
@@ -46,8 +55,8 @@ py_test(
         ":triton",
     ],
     visibility = ["//visibility:public"],
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 py_test(
@@ -65,15 +74,18 @@ py_test(
         ":triton",
     ],
     visibility = ["//visibility:public"],
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 py_test(
     name = "test_gdn_block_prefill_rocm",
     srcs = ["test_gdn_block_prefill.py"],
     main = "test_gdn_block_prefill.py",
-    deps = ["//rtp_llm/models_py/triton_kernels:fla"] + [
+    deps = [
+        "//rtp_llm/models_py/triton_kernels:fla",
+        "//rtp_llm/models_py/triton_kernels:causal_conv1d",
+    ] + [
         ":einops",
         ":numpy",
         ":packaging",
@@ -116,8 +128,8 @@ py_test(
         ":triton",
     ],
     visibility = ["//visibility:public"],
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 # Reuse test_chunk_prefill on AMD to verify chunk-gdn Triton path on ROCm.
@@ -163,8 +175,8 @@ py_test(
         ":triton",
     ],
     visibility = ["//visibility:public"],
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 py_test(

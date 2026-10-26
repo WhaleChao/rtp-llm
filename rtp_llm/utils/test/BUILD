@@ -41,8 +41,14 @@ py_test(
         "@//:using_cuda13_x86": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
-    tags = ["A10_CU13", "no-cache"],
-    exec_properties = {"gpu": "A10_CU13"},
+    tags = ["L20_CU13", "no-cache"],
+    exec_properties = {"gpu": "L20_CU13"},
+)
+
+py_test(
+    name = "jit_cache_deep_gemm_test",
+    srcs = ["jit_cache_deep_gemm_test.py"],
+    deps = ["//rtp_llm:jit_cache_manager_lib"],
 )
 
 py_test(
@@ -191,13 +197,13 @@ py_test(
     deps = [
         "//rtp_llm:utils",
     ],
-    data = [
-        "//:rtp_compute_ops",
-        "//:th_transformer",
-        "//:th_transformer_config",
-    ],
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+)
+
+py_test(
+    name = "process_lifecycle_test",
+    srcs = ["process_lifecycle_test.py"],
+    deps = ["//rtp_llm:utils"],
+    timeout = "short",
 )
 
 py_test(
@@ -209,13 +215,6 @@ py_test(
         ":grpcio",
         "//rtp_llm:utils",
     ],
-    data = [
-        "//:rtp_compute_ops",
-        "//:th_transformer",
-        "//:th_transformer_config",
-    ],
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
 )
 
 py_test(
@@ -227,6 +226,17 @@ py_test(
         "//rtp_llm:utils",
         "//rtp_llm/cpp/model_rpc/proto:model_rpc_service_py_proto",
         "//rtp_llm/metrics",
+    ],
+)
+
+py_test(
+    name = "grpc_util_test",
+    srcs = ["grpc_util_test.py"],
+    deps = [
+        ":protobuf",
+        "//rtp_llm:torch",
+        "//rtp_llm:utils",
+        "//rtp_llm/cpp/model_rpc/proto:model_rpc_service_py_proto",
     ],
 )
 
@@ -243,8 +253,8 @@ py_test(
         "//:th_transformer",
         "//:th_transformer_config",
     ],
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 py_test(
@@ -257,13 +267,6 @@ py_test(
         "//rtp_llm:fastapi",
         "//rtp_llm:utils",
     ],
-    data = [
-        "//:rtp_compute_ops",
-        "//:th_transformer",
-        "//:th_transformer_config",
-    ],
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
 )
 
 py_test(

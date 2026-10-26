@@ -18,8 +18,8 @@ py_test(
     deps = [
         "//rtp_llm:testlib",
     ],
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 py_library(
@@ -28,6 +28,18 @@ py_library(
         "kv_cache_event_test_values.py",
     ],
     visibility = ["//rtp_llm/server/server_args/test:__pkg__"],
+)
+
+py_test(
+    name = "model_config_override_test",
+    srcs = ["model_config_override_test.py"],
+    data = ["//:th_transformer_config"],
+    deps = [
+        "//rtp_llm:config",
+        "//rtp_llm:config_ops",
+        "//rtp_llm:pydantic",
+        "//rtp_llm:transformers",
+    ],
 )
 
 py_test(
@@ -62,5 +74,32 @@ py_test(
     srcs = ["output_vocab_config_test.py"],
     deps = [
         "//rtp_llm:config",
+    ],
+)
+
+py_test(
+    name = "model_size_test",
+    srcs = ["model_size_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)
+
+py_test(
+    name = "quant_config_test",
+    srcs = ["quant_config_test.py"],
+    deps = [
+        "//rtp_llm:config",
+    ],
+)
+
+py_test(
+    name = "engine_config_test",
+    srcs = [
+        "engine_config_test.py",
+    ],
+    data = [
+        "//:th_transformer_config",
+    ],
+    deps = [
+        "//rtp_llm:config_ops",
     ],
 )

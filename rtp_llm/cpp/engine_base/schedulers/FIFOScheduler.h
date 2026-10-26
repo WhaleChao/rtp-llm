@@ -109,9 +109,10 @@ private:
     void dispatchPreparedGroup(StreamGroup& group);
 
     void    cancelExtraStreams() override;
-    bool    hasExtraStreams() const override;
     int64_t extraOnflightStreams() const override;
     void    fillExtraMetrics(RtpLLMSchedulerMetricsCollector& collector) const override;
+    void    appendExtraRunningTaskList(std::vector<EngineScheduleInfo::TaskInfo>& task_list) const override;
+    bool    partitionChunkContinuations();
 
     // Explicit request groups (enqueueGroup). Each group is admitted as a whole
     // to an isolated execution boundary; a partially admitted group keeps its
@@ -122,9 +123,9 @@ private:
     // Context-parallel prefill can opt into single-request admission until
     // the model-side path supports per-request layouts.
     const bool cp_force_single_prefill_ = false;
+    const size_t max_batch_kv_len_        = 0;
     // Soft per-round quota on the tokens that are actually recomputed (prefix-cache hits
     // excluded). 0 disables it.
-    const size_t max_batch_kv_len_               = 0;
     const size_t max_batch_tokens_without_cache_ = 0;
     const size_t prefill_cp_size_                = 1;
 
@@ -134,6 +135,7 @@ private:
     bool                         prefer_group_next_            = false;
 
     // TODO @wangyin support different beams run togather
+    std::list<GenerateStreamPtr> pending_decode_streams_;
 };
 
 }  // namespace rtp_llm

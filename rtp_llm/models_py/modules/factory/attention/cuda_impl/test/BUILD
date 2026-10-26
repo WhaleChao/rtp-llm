@@ -12,6 +12,7 @@ py_test_deps = [
 flashinfer_deps = [
     "//rtp_llm:apache-tvm-ffi",
     "//rtp_llm:flashinfer-python",
+    "//rtp_llm:flashinfer-cubin",
 ]
 
 CUDA13_X86_ONLY = select({
@@ -142,6 +143,13 @@ py_test(
         "H20_CU13",
         "cuda13",
     ],
+    # DeepJIT (rtp-kernel's C++ disk cache) keys its directory off $HOME and
+    # hard-fails when HOME is empty ("HOME environment variable must not be
+    # empty", cache/disk.hpp); the python layer exposes no cache-dir override,
+    # so DG_JIT_CACHE_DIR (deep_gemm) is not the knob for this test. Inherit the
+    # real HOME to reuse the per-user cache; test_xqa.py keeps a writable
+    # fallback for direct runs outside Bazel.
+    env_inherit = ["HOME"],
     target_compatible_with = CUDA13_X86_ONLY,
     exec_properties = {
         "gpu": "H20_CU13",
@@ -305,8 +313,8 @@ py_test(
         "test_flashinfer_prefill/test_mha_rotary_emb.py",
     ],
     deps = flashinfer_test_deps,
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
     target_compatible_with = CUDA13_X86_ONLY,
 )
 

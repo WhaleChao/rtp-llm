@@ -57,7 +57,7 @@ std::vector<std::string> GroupBlockIds::orderedTags() const {
     return tags;
 }
 
-void KVCacheResource::initGroups(std::shared_ptr<const CacheTopology> topology) {
+void KVCacheResource::initGroups(std::shared_ptr<const CacheTopology> topology, bool materialize_layer_views) {
     RTP_LLM_CHECK_WITH_INFO(topology != nullptr, "KVCacheResource::initGroups requires a topology");
     GroupBlockIds candidate;
     const auto& groups = topology->groups();
@@ -75,21 +75,24 @@ void KVCacheResource::initGroups(std::shared_ptr<const CacheTopology> topology) 
     candidate.validate();
 
     std::vector<std::vector<std::string>> layer_tags;
-    layer_tags.reserve(topology->layers().size());
-    for (const auto& layer : topology->layers()) {
-        RTP_LLM_CHECK_WITH_INFO(layer.layer_id >= 0 && static_cast<size_t>(layer.layer_id) == layer_tags.size(),
-                                "KVCacheResource invalid layer_id=%d",
-                                layer.layer_id);
-        for (const auto& tag : layer.group_tags) {
-            (void)candidate.blockIds(tag);
+    if (materialize_layer_views) {
+        layer_tags.reserve(topology->layers().size());
+        for (const auto& layer : topology->layers()) {
+            RTP_LLM_CHECK_WITH_INFO(layer.layer_id >= 0 && static_cast<size_t>(layer.layer_id) == layer_tags.size(),
+                                    "KVCacheResource invalid layer_id=%d",
+                                    layer.layer_id);
+            for (const auto& tag : layer.group_tags) {
+                (void)candidate.blockIds(tag);
+            }
+            layer_tags.push_back(layer.group_tags);
         }
-        layer_tags.push_back(layer.group_tags);
     }
 
     // All throwing construction/validation finished; publish both views together.
     group_block_ids.tag_to_index_.swap(candidate.tag_to_index_);
     group_block_ids.rows_.swap(candidate.rows_);
     layer_group_tags_.swap(layer_tags);
+    topology_ = materialize_layer_views ? nullptr : std::move(topology);
 }
 
 size_t BlockIds::blocksNum() const {
@@ -101,11 +104,40 @@ const BlockIndicesType& BlockIds::blocks() const {
 }
 
 const BlockIndicesType& BlockIds::kernelBlocks() const {
+    if (cyclic_bank_count_ > 0) {
+        syncKernelBlocks();
+    }
     return kernel_block_indices_;
+}
+
+void BlockIds::copySharedKernelBlocks(size_t prompt_tail, size_t chunk_tail, BlockIdxType* destination) const {
+    RTP_LLM_CHECK(kernel_blocks_per_kv_block_ == 1 && prompt_tail < blocksNum() && chunk_tail <= prompt_tail
+                  && block_indices[prompt_tail] > 0);
+    std::fill_n(destination, prompt_tail + 1, NULL_BLOCK_IDX);
+    destination[chunk_tail] = block_indices[prompt_tail];
+    std::copy(block_indices.begin() + prompt_tail + 1, block_indices.end(), destination + prompt_tail + 1);
 }
 
 size_t BlockIds::kernelBlocksPerKvBlock() const {
     return kernel_blocks_per_kv_block_;
+}
+
+void BlockIds::copyCyclicKernelBlocks(size_t prompt_tail, size_t bank_count, BlockIdxType* destination) const {
+    RTP_LLM_CHECK(kernel_blocks_per_kv_block_ == 1 && prompt_tail < blocksNum() && bank_count > 0
+                  && bank_count <= prompt_tail + 1);
+    if (cyclic_prompt_tail_ != prompt_tail || cyclic_bank_count_ != bank_count) {
+        const size_t bank_begin = prompt_tail + 1 - bank_count;
+        for (size_t pos = bank_begin; pos <= prompt_tail; ++pos) {
+            RTP_LLM_CHECK(block_indices[pos] > 0);
+        }
+        kernel_block_indices_ = block_indices;
+        for (size_t pos = 0; pos <= prompt_tail; ++pos) {
+            kernel_block_indices_[pos] = block_indices[prompt_tail - (prompt_tail - pos) % bank_count];
+        }
+        cyclic_prompt_tail_ = prompt_tail;
+        cyclic_bank_count_  = bank_count;
+    }
+    std::copy(kernel_block_indices_.begin(), kernel_block_indices_.end(), destination);
 }
 
 BlockIdxType BlockIds::popBack() {
@@ -113,6 +145,9 @@ BlockIdxType BlockIds::popBack() {
     const BlockIdxType val = block_indices.back();
     block_indices.pop_back();
     kernel_block_indices_.resize(block_indices.size() * kernel_blocks_per_kv_block_);
+    if (cyclic_bank_count_ > 0) {
+        syncKernelBlocks();
+    }
     return val;
 }
 
@@ -172,6 +207,9 @@ void BlockIds::setAt(size_t pos, BlockIdxType val) {
 
 void BlockIds::resize(size_t new_size, BlockIdxType value) {
     const size_t old_size = block_indices.size();
+    if (new_size != old_size && cyclic_bank_count_ > 0) {
+        syncKernelBlocks();
+    }
     block_indices.resize(new_size, value);
     kernel_block_indices_.resize(new_size * kernel_blocks_per_kv_block_);
     for (size_t i = old_size; i < new_size; ++i) {
@@ -179,7 +217,10 @@ void BlockIds::resize(size_t new_size, BlockIdxType value) {
     }
 }
 
-void BlockIds::updateKernelSlotAt(size_t pos, BlockIdxType val) {
+void BlockIds::updateKernelSlotAt(size_t pos, BlockIdxType val) const {
+    if (cyclic_bank_count_ > 0) {
+        syncKernelBlocks();
+    }
     const size_t bpk      = kernel_blocks_per_kv_block_;
     const size_t base_pos = pos * bpk;
     RTP_LLM_CHECK_WITH_INFO(base_pos + bpk <= kernel_block_indices_.size(),
@@ -200,7 +241,8 @@ void BlockIds::updateKernelSlotAt(size_t pos, BlockIdxType val) {
     }
 }
 
-void BlockIds::syncKernelBlocks() {
+void BlockIds::syncKernelBlocks() const {
+    cyclic_bank_count_ = 0;
     const size_t n   = block_indices.size();
     const size_t bpk = kernel_blocks_per_kv_block_;
     kernel_block_indices_.resize(n * bpk);
@@ -275,6 +317,9 @@ void KVCacheResource::checkLayerTag(int layer_id, std::string_view tag) const {
 }
 
 const std::vector<std::string>& KVCacheResource::groupTagsForLayer(int layer_id) const {
+    if (topology_) {
+        return topology_->layer(layer_id).group_tags;
+    }
     RTP_LLM_CHECK_WITH_INFO(layer_id >= 0 && static_cast<size_t>(layer_id) < layer_group_tags_.size(),
                             "KVCacheResource invalid layer_id=%d size=%zu",
                             layer_id,
@@ -290,12 +335,15 @@ const std::string& KVCacheResource::soleGroupTagForLayer(int layer_id) const {
 }
 
 bool KVCacheResource::hasOneGroupPerLayer() const {
+    if (topology_) {
+        return topology_->hasOneGroupPerLayer();
+    }
     return std::all_of(
         layer_group_tags_.begin(), layer_group_tags_.end(), [](const auto& tags) { return tags.size() == 1; });
 }
 
 int KVCacheResource::layerNum() const {
-    return static_cast<int>(layer_group_tags_.size());
+    return topology_ ? static_cast<int>(topology_->layers().size()) : static_cast<int>(layer_group_tags_.size());
 }
 
 int KVCacheResource::groupNums() const {
@@ -328,9 +376,9 @@ LayerBlockIds KVCacheResource::layerBlocks() const {
                             "KVCacheResource::layerBlocks is a deprecated single-group-per-layer projection; "
                             "use blockIdsForLayer(layer, tag) for multi-group layers");
     LayerBlockIds layer_blocks;
-    layer_blocks.reserve(layer_group_tags_.size());
-    for (const auto& tags : layer_group_tags_) {
-        layer_blocks.push_back(groupBlockIds(tags.front()));
+    layer_blocks.reserve(layerNum());
+    for (int layer = 0; layer < layerNum(); ++layer) {
+        layer_blocks.push_back(groupBlockIds(soleGroupTagForLayer(layer)));
     }
     return layer_blocks;
 }

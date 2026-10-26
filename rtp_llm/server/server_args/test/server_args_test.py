@@ -1,3 +1,4 @@
+import argparse
 import importlib
 import io
 import json
@@ -122,6 +123,41 @@ class CacheConfigArgumentsTest(TestCase):
         with patch.dict(os.environ, env, clear=True), patch.object(sys, "argv", argv):
             parser.parse_args(None if use_sys_argv else args)
         return config
+
+    def test_crc_default_and_environment(self):
+        for args in (None, []):
+            for env, expected in (
+                ({}, True),
+                ({"ENABLE_CRC": "0"}, False),
+                ({"ENABLE_CRC": "1"}, True),
+            ):
+                with self.subTest(args=args, env=env):
+                    config = self.parse_cache_config(args, env)
+                    self.assertIs(config.enable_crc, expected)
+
+    def test_crc_cli_overrides_environment(self):
+        for value, expected, env_value in (("0", False, "1"), ("1", True, "0")):
+            for args in (["--enable_crc", value], [f"--enable_crc={value}"]):
+                for use_sys_argv in (False, True):
+                    with self.subTest(args=args, use_sys_argv=use_sys_argv):
+                        config = self.parse_cache_config(
+                            args, {"ENABLE_CRC": env_value}, use_sys_argv
+                        )
+                        self.assertIs(config.enable_crc, expected)
+
+    def test_crc_rejects_invalid_boolean(self):
+        for args, env in (
+            (None, {"ENABLE_CRC": "invalid"}),
+            ([], {"ENABLE_CRC": "invalid"}),
+            (["--enable_crc", "invalid"], {}),
+        ):
+            with self.subTest(args=args, env=env), patch(
+                "sys.stderr", new_callable=io.StringIO
+            ) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    self.parse_cache_config(args, env)
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("Boolean value expected", stderr.getvalue())
 
     def test_canonical_env_and_cli_bind_all_fields(self):
         samples = self.startup_samples()
@@ -423,6 +459,85 @@ class ServerArgsSetTest(TestCase):
         with self.assertRaisesRegex(ValueError, "valid HTTP header"):
             config.validate_allocator_dump_config()
 
+    def test_graph_capture_bootstrap_pickle_and_trace_json_round_trip(self):
+        from rtp_llm.config.model_config import ModelConfig, _apply_model_override_args
+        from rtp_llm.ops import HiddenStateCaptureDtype
+        from rtp_llm.server.server_args import server_args
+        from rtp_llm.telemetry.config import CONFIG_ENV, parse_trace_config
+
+        trace_json = json.dumps(
+            {
+                "enabled": True,
+                "endpoint": "http://127.0.0.1:4318/v1/traces",
+                "headers": {"x-test": "round-trip"},
+                "sampler_ratio": 0.25,
+            }
+        )
+        for dtype_name in ("bf16", "fp8_e4m3"):
+            with self.subTest(dtype=dtype_name), patch.dict(
+                os.environ,
+                {
+                    CONFIG_ENV: trace_json,
+                    "JSON_MODEL_OVERRIDE_ARGS": json.dumps(
+                        {
+                            "hidden_state_capture_layer_ids": [1],
+                            "hidden_state_capture_dtype": (
+                                "fp8_e4m3" if dtype_name == "bf16" else "bf16"
+                            ),
+                        }
+                    ),
+                },
+            ):
+                configs = server_args.setup_args(
+                    [
+                        "--enable_cuda_graph",
+                        "1",
+                        "--generation_prefill_cuda_graph_max_requests",
+                        "3",
+                        "--max_context_batch_size",
+                        "3",
+                        "--generation_prefill_capture_config",
+                        "32,64",
+                        "--json_model_override_args",
+                        json.dumps(
+                            {
+                                "hidden_state_capture_layer_ids": [2, 0],
+                                "hidden_state_capture_dtype": dtype_name,
+                            }
+                        ),
+                    ]
+                )
+                # ModelConfig has no pickle contract; transport the existing
+                # bootstrap inputs and apply them through the production path.
+                hw_config, model_args, restored_trace_json = pickle.loads(
+                    pickle.dumps(
+                        (
+                            configs.py_hw_kernel_config,
+                            configs.model_args,
+                            os.environ[CONFIG_ENV],
+                        )
+                    )
+                )
+                model_config = ModelConfig()
+                model_config.num_layers = 4
+                _apply_model_override_args(model_config, model_args)
+                self.assertEqual(model_config.hidden_state_capture_layer_ids, [2, 0])
+                self.assertEqual(
+                    model_config.hidden_state_capture_dtype,
+                    HiddenStateCaptureDtype.__members__[dtype_name.upper()],
+                )
+                self.assertTrue(hw_config.enable_cuda_graph)
+                self.assertEqual(
+                    hw_config.generation_prefill_cuda_graph_max_requests, 3
+                )
+                self.assertEqual(
+                    hw_config.generation_prefill_capture_token_buckets, [32, 64]
+                )
+                trace_config = parse_trace_config(restored_trace_json)
+                self.assertEqual(trace_config, parse_trace_config(trace_json))
+                self.assertTrue(trace_config.enabled)
+                self.assertEqual(trace_config.sampler_ratio, 0.25)
+
     def test_env_vars_set_to_py_env_configs(self):
         """Test that environment variables are correctly set to py_env_configs."""
         # Set environment variables
@@ -436,7 +551,9 @@ class ServerArgsSetTest(TestCase):
         os.environ["PREFILL_PREPARE_RESOURCE_POOL_SIZE"] = "256"
         os.environ["MAX_CONTEXT_BATCH_SIZE"] = "32"
         os.environ["MAX_BATCH_TOKENS_WITHOUT_CACHE"] = "2048"
+        os.environ["MAX_BATCH_KV_LEN"] = "16384"
         os.environ["CP_FORCE_SINGLE_PREFILL"] = "0"
+        os.environ["PREFILL_CHUNK_SIZE"] = "256"
         os.environ["WARM_UP"] = "1"
         os.environ["MAX_SEQ_LEN"] = "4096"
         os.environ["REMOTE_JIT_DIR"] = "dfs://bucket/jit/cache"
@@ -498,6 +615,10 @@ class ServerArgsSetTest(TestCase):
             2048,
         )
         self.assertEqual(
+            py_env_configs.runtime_config.fifo_scheduler_config.prefill_chunk_size,
+            256,
+        )
+        self.assertEqual(
             py_env_configs.runtime_config.fifo_scheduler_config.cp_force_single_prefill,
             False,
         )
@@ -505,6 +626,12 @@ class ServerArgsSetTest(TestCase):
             pickle.dumps(py_env_configs.runtime_config.fifo_scheduler_config)
         )
         self.assertEqual(restored_fifo_config.max_batch_tokens_without_cache, 2048)
+        self.assertEqual(restored_fifo_config.prefill_chunk_size, 256)
+        self.assertEqual(
+            py_env_configs.runtime_config.fifo_scheduler_config.max_batch_kv_len,
+            16384,
+        )
+        self.assertEqual(restored_fifo_config.max_batch_kv_len, 16384)
         # Old pickles carry only the two original slots; every field added later
         # must fall back to its default instead of raising.
         fifo_config_type = type(py_env_configs.runtime_config.fifo_scheduler_config)
@@ -514,6 +641,19 @@ class ServerArgsSetTest(TestCase):
         self.assertEqual(legacy_fifo_config.max_batch_tokens_size, 8192)
         self.assertEqual(legacy_fifo_config.max_inited_kv_cache_streams, 0)
         self.assertEqual(legacy_fifo_config.max_batch_tokens_without_cache, 0)
+        seven_slot_fifo_config = fifo_config_type.__new__(fifo_config_type)
+        seven_slot_fifo_config.__setstate__(
+            (32, 8192, "ratio", "2", False, 16, 2048)
+        )
+        self.assertEqual(seven_slot_fifo_config.max_batch_tokens_without_cache, 2048)
+        self.assertEqual(seven_slot_fifo_config.prefill_chunk_size, 0)
+        self.assertEqual(seven_slot_fifo_config.max_batch_kv_len, 0)
+        eight_slot_fifo_config = fifo_config_type.__new__(fifo_config_type)
+        eight_slot_fifo_config.__setstate__(
+            (32, 8192, "ratio", "2", False, 16, 2048, 256)
+        )
+        self.assertEqual(eight_slot_fifo_config.prefill_chunk_size, 256)
+        self.assertEqual(eight_slot_fifo_config.max_batch_kv_len, 0)
 
         # Verify frontend and DashSc pre-stop windows are configured independently.
         self.assertEqual(
@@ -595,6 +735,10 @@ class ServerArgsSetTest(TestCase):
             "64",
             "--max_batch_tokens_without_cache",
             "4096",
+            "--max_batch_kv_len",
+            "32768",
+            "--prefill_chunk_size",
+            "512",
             "--cp_force_single_prefill",
             "false",
             "--max_inited_kv_cache_streams",
@@ -657,6 +801,10 @@ class ServerArgsSetTest(TestCase):
             4096,
         )
         self.assertEqual(
+            py_env_configs.runtime_config.fifo_scheduler_config.prefill_chunk_size,
+            512,
+        )
+        self.assertEqual(
             py_env_configs.runtime_config.fifo_scheduler_config.cp_force_single_prefill,
             False,
         )
@@ -665,6 +813,10 @@ class ServerArgsSetTest(TestCase):
             16,
         )
 
+        self.assertEqual(
+            py_env_configs.runtime_config.fifo_scheduler_config.max_batch_kv_len,
+            32768,
+        )
         # Verify runtime_config (warm_up is now in RuntimeConfig)
         self.assertEqual(py_env_configs.runtime_config.warm_up, False)  # bool in C++
         self.assertEqual(py_env_configs.runtime_config.warm_up_with_loss, False)
@@ -1538,8 +1690,7 @@ class ServerArgsSetTest(TestCase):
             config["client_config"]["grpc.max_receive_message_length"], expected
         )
         self.assertEqual(
-            config["server_config"]["grpc.max_receive_message_length"],
-            64 * 1024 * 1024,
+            config["server_config"]["grpc.max_receive_message_length"], expected
         )
 
 
@@ -1673,6 +1824,28 @@ class ServerArgsGrammarConfigTest(TestCase):
                 sys.argv = ["prog", flag, "0"]
                 with self.assertRaises(SystemExit):
                     self._setup()
+
+
+class GenerateArgsFromEnvTest(TestCase):
+    def test_str2bool_environment_value_is_not_dropped(self):
+        from rtp_llm.server.server_args.generate_args_from_env_clean import (
+            format_argument_pair,
+            read_env_value,
+        )
+        from rtp_llm.server.server_args.util import str2bool
+
+        with patch.dict(os.environ, {"ENABLE_CRC": "0"}, clear=True):
+            value = read_env_value("ENABLE_CRC", True, str2bool)
+        self.assertIs(value, False)
+        self.assertEqual(format_argument_pair("--enable_crc", value), ["--enable_crc", "0"])
+
+    def test_invalid_str2bool_environment_value_is_rejected(self):
+        from rtp_llm.server.server_args.generate_args_from_env_clean import read_env_value
+        from rtp_llm.server.server_args.util import str2bool
+
+        with patch.dict(os.environ, {"ENABLE_CRC": "not-a-bool"}, clear=True):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                read_env_value("ENABLE_CRC", True, str2bool)
 
 
 if __name__ == "__main__":

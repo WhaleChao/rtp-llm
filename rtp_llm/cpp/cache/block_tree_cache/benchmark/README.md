@@ -1,5 +1,19 @@
 # BlockTreeCache Benchmark
 
+## Device/Host copy API priority
+
+默认顺序为 `cuda_batch > sm > generic`。
+
+`BLOCK_TREE_DEVICE_HOST_COPY_PRIORITY` 可设置为 `cuda_batch`、`sm` 或 `generic`。
+只把指定接口移到首位，其他接口保持相对顺序。例如：
+
+```bash
+export BLOCK_TREE_DEVICE_HOST_COPY_PRIORITY=sm  # sm > cuda_batch > generic
+```
+
+仅在 executor 构造时读取；未设置/空值使用默认顺序，非法值告警后使用默认顺序。
+优先级不会覆盖接口禁用选项或 SM 阈值。不适用时尝试下一个接口，执行失败则返回错误。
+
 本目录提供 BlockTreeCache 的 Tree 在线生命周期 microbenchmark 与 Device/Host/Disk transfer benchmark。当前实现以 workload 可核对、失败可传播、repetition 相互独立为前提；整改前的 buffered 大工作集与 round-trip 数值不能作为基线。
 
 > [!IMPORTANT]
@@ -34,7 +48,7 @@
 cd github-opensource
 
 # 同一份普通构建同时用于指标和 CPU perf；DWARF unwind 不改变 C++ action key
-bazelisk build -c opt --config=cuda13 --config=sm8x \
+bazelisk build -c opt --config=cuda13 \
   //rtp_llm/cpp/cache/block_tree_cache/benchmark:block_tree_cache_gpu_benchmark \
   //rtp_llm/cpp/cache/block_tree_cache/benchmark:block_tree_cache_benchmark_driver
 ```
@@ -69,13 +83,13 @@ find ~/.cache/bazel -name "libpython3.10.so" -path "*/block_tree_cache*" 2>/dev/
 
 ```bash
 # Driver/registry/文档与 C++ workload 看护（统一使用 GPU 锁）
-bazelisk test -c opt --config=cuda13 --config=sm8x \
+bazelisk test -c opt --config=cuda13 \
   //rtp_llm/cpp/cache/block_tree_cache/benchmark:benchmark_driver_profile_test \
   //rtp_llm/cpp/cache/block_tree_cache/benchmark:transfer_benchmark_workload_test \
   //rtp_llm/cpp/cache/block_tree_cache/benchmark:tree_workload_generator_test
 
 # 真实 binary + driver 端到端看护（需 GPU）
-bazelisk test -c opt --config=cuda13 --config=sm8x \
+bazelisk test -c opt --config=cuda13 \
   //rtp_llm/cpp/cache/block_tree_cache/benchmark:block_tree_cache_benchmark_smoke_test
 ```
 

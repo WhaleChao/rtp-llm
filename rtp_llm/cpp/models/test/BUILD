@@ -42,8 +42,8 @@ cc_test(
     env = {
         "TEST_USING_DEVICE": "CUDA",
     },
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 cc_test(
@@ -55,8 +55,8 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ] + torch_deps(),
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 py_test(
@@ -77,11 +77,14 @@ cc_library(
     copts = test_copts,
     deps = [
         "//rtp_llm/cpp/cache",
+        "//rtp_llm/cpp/config:static_config",
         "//rtp_llm/cpp/disaggregate/cache_store:cache_store_interface",
+        "//rtp_llm/cpp/metrics:metrics",
         "//rtp_llm/cpp/models",
         "//rtp_llm/cpp/utils:core_utils",
         "//rtp_llm/models_py/bindings:op_defs",
         "//rtp_llm/models_py/bindings/common",
+        "@havenask//aios/kmonitor:kmonitor_client_cpp",
     ] + select({
         "@//:using_rocm": [
             "//rtp_llm/models_py/bindings/core:exec_ctx_rocm",
@@ -111,8 +114,8 @@ py_test(
     data = [":th_pywrapped_model_cache_store_integration_test"],
     deps = pywrapped_model_test_deps,
     env = {"TEST_USING_DEVICE": "CUDA"},
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 py_test(
