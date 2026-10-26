@@ -6,7 +6,7 @@ from rtp_llm.config.layer_partition import local_layer_range
 from rtp_llm.config.model_args import ModelArgs
 from rtp_llm.model_factory import ModelFactory
 from rtp_llm.models.base_model import BaseModel
-from rtp_llm.ops import SpeculativeType, TaskType
+from rtp_llm.ops import RoleType, SpeculativeType, TaskType
 
 
 def make_engine_config(sp_type, pp_size, pp_rank):
@@ -22,7 +22,10 @@ def make_engine_config(sp_type, pp_size, pp_rank):
         ),
         sp_config=SimpleNamespace(type=sp_type, gen_num_per_cycle=2),
         runtime_config=SimpleNamespace(
-            warm_up=False, model_warm_up=False, max_generate_batch_size=8
+            warm_up=False,
+            model_warm_up=False,
+            max_generate_batch_size=8,
+            use_batch_decode_scheduler=False,
         ),
         load_config=SimpleNamespace(
             load_method="auto",
@@ -30,6 +33,7 @@ def make_engine_config(sp_type, pp_size, pp_rank):
             moe_pure_tp_preshard=False,
             force_cpu_load_weights=False,
         ),
+        pd_sep_config=SimpleNamespace(role_type=RoleType.PDFUSION),
         hw_kernel_config=MagicMock(),
         kv_cache_config=MagicMock(),
         fmha_config=MagicMock(),
@@ -50,10 +54,16 @@ class DraftModelLoadingTest(unittest.TestCase):
                 engine = make_engine_config(SpeculativeType.MTP, pp_size, 0)
                 engine.parallelism_config.pp_stage_layer_counts = counts
                 engine.runtime_config.fifo_scheduler_config = SimpleNamespace(
-                    max_context_batch_size=1, max_batch_tokens_size=0
+                    max_context_batch_size=1,
+                    max_batch_tokens_size=0,
+                    prefill_chunk_size=0,
                 )
                 model = SimpleNamespace(
-                    num_layers=12, max_seq_len=128, to_string=lambda: "target"
+                    num_layers=12,
+                    max_seq_len=128,
+                    model_name="target",
+                    attn_config=SimpleNamespace(tokens_per_block=16),
+                    to_string=lambda: "target",
                 )
                 model_cls = MagicMock(__name__="TestTarget")
                 model_cls._create_config.return_value = model
@@ -220,7 +230,7 @@ class DraftModelLoadingTest(unittest.TestCase):
                 factory.assert_not_called()
                 self.assertEqual(engine_config.sp_config.type, expected)
 
-    def test_pp_load_requires_explicit_model_support_including_mtp(self):
+    def test_pp_load_requires_support_only_for_partitioned_target(self):
         from rtp_llm.models.qwen3_next.qwen3_next import (
             Qwen3Next,
             Qwen35Dense,
@@ -261,7 +271,8 @@ class DraftModelLoadingTest(unittest.TestCase):
                     model.parallelism_config = SimpleNamespace(pp_size=pp_size)
                     model.hw_kernel_config = SimpleNamespace(enable_cuda_graph=False)
                     self.assertEqual(model.support_pp(), supports_pp)
-                    reject = pp_size > 1 and not supports_pp
+                    # Drafts run in full on the last stage and are not PP-partitioned.
+                    reject = pp_size > 1 and not is_mtp and not supports_pp
                     with patch.object(
                         model, "_init_custom_module", return_value=None
                     ), patch.object(

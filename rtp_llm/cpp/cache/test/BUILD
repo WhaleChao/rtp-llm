@@ -105,6 +105,9 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ] + torch_deps() + cuda13_torch_link_deps,
     env = {},
+    # The Torch/exec_ops link closure requires the CUDA driver at startup.
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 cc_test(
@@ -123,6 +126,9 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ] + torch_deps() + cuda13_torch_link_deps,
     env = {},
+    # The Torch/exec_ops link closure requires the CUDA driver at startup.
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 cc_test(

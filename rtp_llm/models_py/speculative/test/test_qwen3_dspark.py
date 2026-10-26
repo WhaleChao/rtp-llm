@@ -240,6 +240,7 @@ class Qwen3DSparkRegistrationTest(unittest.TestCase):
     def _capture_harness(layer_ids: tuple[int, ...]) -> GptModelBase:
         config = SimpleNamespace(
             num_layers=max(layer_ids, default=0) + 1,
+            is_mtp=False,
             vocab_size=1,
             capture_aux_hidden_layer_ids=layer_ids,
         )
