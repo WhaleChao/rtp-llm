@@ -1,3 +1,4 @@
+import copy
 import functools
 import json
 import logging
@@ -222,6 +223,8 @@ class ReasoningToolBaseRenderer(CustomChatRenderer, ABC):
 
         Returns OutputDelta if content is ready, None if buffering.
         """
+        if status.compact_logprobs:
+            status.reasoning_logprob_text += delta_text
         delta_text = status.delta_output_string + delta_text
         status.delta_output_string = delta_text
 
@@ -232,6 +235,10 @@ class ReasoningToolBaseRenderer(CustomChatRenderer, ABC):
             is_streaming,
             status,
         )
+        if status.compact_logprobs and len(status.delta_output_string) < len(delta_text):
+            removed = len(delta_text) - len(status.delta_output_string)
+            status.reasoning_logprob_text = status.reasoning_logprob_text[:-removed]
+            status.reasoning_logprob_stopped = True
 
         if should_buffer:
             return None
@@ -246,6 +253,8 @@ class ReasoningToolBaseRenderer(CustomChatRenderer, ABC):
                 status, output, is_streaming
             )
             if tool_delta is not None:
+                if status.compact_logprobs:
+                    status.reasoning_logprob_ready_text = status.reasoning_logprob_text
                 # _process_reasoning_and_tool_calls may include remaining normal text
                 # in DeltaMessage.content (streaming mode). Clear delta_output_string
                 # to avoid re-prepending already-emitted content in subsequent tokens.
@@ -256,9 +265,15 @@ class ReasoningToolBaseRenderer(CustomChatRenderer, ABC):
                 return tool_delta
 
         if status.delta_output_string:
+            if status.compact_logprobs:
+                status.reasoning_logprob_ready_text = status.reasoning_logprob_text
             delta = OutputDelta(
                 output_str=status.delta_output_string,
-                logprobs=await self._generate_log_probs(status, output),
+                logprobs=(
+                    None
+                    if status.compact_logprobs
+                    else await self._generate_log_probs(status, output)
+                ),
                 input_length=output.aux_info.input_len,
                 output_length=output.aux_info.output_len,
                 reuse_length=output.aux_info.reuse_len,
@@ -267,6 +282,30 @@ class ReasoningToolBaseRenderer(CustomChatRenderer, ABC):
             return delta
 
         return None
+
+    def _take_reasoning_compact_logprobs(self, status: StreamStatus):
+        emitted = copy.copy(status)
+        emitted.last_output_ids = status.reasoning_logprob_context_ids
+        self._trim_compact_logprobs(emitted, status.reasoning_logprob_ready_text)
+        positions = set(emitted.pending_logprob_positions)
+        if positions:
+            context_ids = status.output_ids[: max(positions) + 1]
+            consumed_text = len(self.tokenizer.decode(context_ids)) - len(
+                self.tokenizer.decode(status.reasoning_logprob_context_ids)
+            )
+            status.reasoning_logprob_text = status.reasoning_logprob_text[consumed_text:]
+            status.reasoning_logprob_context_ids = context_ids
+        status.reasoning_logprob_ready_text = ""
+        pending = [
+            (position, record)
+            for position, record in zip(
+                status.pending_logprob_positions, status.pending_logprobs
+            )
+            if position not in positions and status.finish_reason is None
+        ]
+        status.pending_logprob_positions = [position for position, _ in pending]
+        status.pending_logprobs = [record for _, record in pending]
+        return self._take_compact_logprobs(emitted)
 
     def _merge_deltas(self, deltas: List[OutputDelta]) -> Optional[OutputDelta]:
         """
@@ -392,6 +431,11 @@ class ReasoningToolBaseRenderer(CustomChatRenderer, ABC):
             functools.partial(self._check_finish_reason, max_new_tokens=max_new_tokens),
             self._remove_stop_word_ids,
         )
+        if status.compact_logprobs and not hasattr(status, "reasoning_logprob_text"):
+            status.reasoning_logprob_text = ""
+            status.reasoning_logprob_ready_text = ""
+            status.reasoning_logprob_context_ids = []
+            status.reasoning_logprob_stopped = False
 
         # NOTE: With multi-token stop words (e.g., tokenized from extra_stop_words),
         # `_remove_stop_word_ids()` may truncate `status.output_ids` to an earlier position
@@ -417,6 +461,10 @@ class ReasoningToolBaseRenderer(CustomChatRenderer, ABC):
                     status.delta_output_string = status.delta_output_string[
                         : -len(longest_suffix)
                     ]
+                    if status.compact_logprobs:
+                        status.reasoning_logprob_text = status.reasoning_logprob_text[
+                            : -len(longest_suffix)
+                        ]
             flushed = await self._process_single_token_delta(
                 status,
                 "",
@@ -425,6 +473,10 @@ class ReasoningToolBaseRenderer(CustomChatRenderer, ABC):
                 stop_word_slice_list,
                 is_streaming,
             )
+            if status.compact_logprobs:
+                logprobs = self._take_reasoning_compact_logprobs(status)
+                if flushed is not None:
+                    flushed.logprobs = logprobs
             if flushed is not None:
                 return flushed
             status.delta_output_string = ""
@@ -443,6 +495,10 @@ class ReasoningToolBaseRenderer(CustomChatRenderer, ABC):
             stop_word_slice_list,
             is_streaming,
         )
+        if status.compact_logprobs:
+            logprobs = self._take_reasoning_compact_logprobs(status)
+            if collected_deltas:
+                collected_deltas[-1].logprobs = logprobs
 
         # Update last_output_ids based on what the NORMALIZER yielded, not what we emitted.
         # If normalizer yielded content but detector buffered it (collected_deltas empty),
@@ -496,6 +552,8 @@ class ReasoningToolBaseRenderer(CustomChatRenderer, ABC):
                 )
                 if token_delta is not None:
                     collected_deltas.append(token_delta)
+                if status.compact_logprobs and status.reasoning_logprob_stopped:
+                    break
             return collected_deltas, normalizer_yielded
 
         # Non-streaming: accumulate all text first, then process once
@@ -561,7 +619,11 @@ class ReasoningToolBaseRenderer(CustomChatRenderer, ABC):
                 tool_calls=tool_calls if has_tool_calls else None,
                 reasoning_content=reasoning_text if has_reasoning else None,
             ),
-            logprobs=await self._generate_log_probs(status, output),
+            logprobs=(
+                None
+                if status.compact_logprobs
+                else await self._generate_log_probs(status, output)
+            ),
             input_length=output.aux_info.input_len,
             output_length=output.aux_info.output_len,
             reuse_length=output.aux_info.reuse_len,

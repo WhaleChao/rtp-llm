@@ -19,6 +19,7 @@ from rtp_llm.openai.renderers.reasoning_tool_base_renderer import (
     ReasoningToolStreamStatus,
 )
 from rtp_llm.utils.base_model_datatypes import AuxInfo, GenerateOutput, GenerateOutputs
+from rtp_llm.utils.word_util import get_stop_word_slices
 
 
 class Tokenizer:
@@ -35,6 +36,9 @@ class Tokenizer:
                 5: "B",
                 6: "STOP",
                 7: "\ufffd",
+                9: "STOPtail",
+                10: "ST",
+                11: "OPtail",
             }.get(int(i), "?")
             for i in ids
         )
@@ -226,6 +230,45 @@ class CompactReasoningRendererTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result.logprobs)
         self.assertTrue(self.status.compact_logprobs)
 
+    async def test_mtp_string_stop_excludes_hidden_token_probabilities(self):
+        del self.renderer._process_stop_words
+        result = await self.renderer._update_single_status(
+            self.status,
+            self.output([4, 9, 5]),
+            64,
+            ["STOP"],
+            get_stop_word_slices(["STOP"]),
+            True,
+        )
+        self.assertEqual(result.output_str, "A")
+        self.assertEqual([record.token for record in result.logprobs], ["A"])
+        self.assertEqual(self.status.pending_logprobs, [])
+
+    async def test_cross_chunk_stop_prefix_keeps_probabilities_pending(self):
+        del self.renderer._process_stop_words
+        first = await self.renderer._update_single_status(
+            self.status,
+            self.output([4, 10]),
+            64,
+            ["STOP"],
+            get_stop_word_slices(["STOP"]),
+            True,
+        )
+        self.assertEqual(first.output_str, "A")
+        self.assertEqual([record.token for record in first.logprobs], ["A"])
+        self.assertEqual(self.status.pending_logprob_positions, [1])
+        second = await self.renderer._update_single_status(
+            self.status,
+            self.output([11]),
+            64,
+            ["STOP"],
+            get_stop_word_slices(["STOP"]),
+            True,
+        )
+        self.assertEqual(second.output_str, "")
+        self.assertIsNone(second.logprobs)
+        self.assertEqual(self.status.pending_logprobs, [])
+
     async def test_logprobs_keeps_the_reasoning_parser(self):
         parser = object()
         self.renderer.in_think_mode = lambda request: True
@@ -242,6 +285,23 @@ class CompactReasoningRendererTest(unittest.IsolatedAsyncioTestCase):
         self.renderer._process_stop_words = lambda text, *args: (text, False)
         second = await self.update(self.output([5]))
         self.assertEqual([record.token for record in second.logprobs], ["A", "B"])
+
+    async def test_detector_buffer_retains_later_mtp_token_probabilities(self):
+        class BufferingParser:
+            def parse_stream_chunk(self, text):
+                return ("", "") if text == "B" else ("", text)
+
+        self.status.reasoning_parser = BufferingParser()
+        first = await self.update(self.output([4, 5]))
+        self.assertEqual(first.output_str, "A")
+        self.assertEqual([record.token for record in first.logprobs], ["A"])
+        self.assertEqual(self.status.pending_logprob_positions, [1])
+
+    async def test_mtp_utf8_suffix_keeps_probabilities_pending(self):
+        first = await self.update(self.output([4, 7]))
+        self.assertEqual(first.output_str, "A")
+        self.assertEqual([record.token for record in first.logprobs], ["A"])
+        self.assertEqual(self.status.pending_logprob_positions, [1])
 
     async def test_split_utf8_retains_both_token_records(self):
         class SplitTokenizer(Tokenizer):

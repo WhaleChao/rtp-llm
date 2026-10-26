@@ -82,14 +82,15 @@ absl::StatusOr<SamplerInputs> NormalSamplerInputGatherer::gather(const StreamGro
     if (!raw_logprobs_row_indices.empty()) {
         RTP_LLM_CHECK(model_output.logits.defined());
         RTP_LLM_CHECK(model_output.logits.dim() == 2);
-        const int64_t real_vocab_size = all_streams.front()->vocabSize();
+        const int64_t real_vocab_size = configured_vocab_size;
         RTP_LLM_CHECK(real_vocab_size > 0);
         RTP_LLM_CHECK_WITH_INFO(real_vocab_size <= model_output.logits.size(1),
                                 "real vocab size %ld exceeds logits width %ld for logprobs",
                                 real_vocab_size,
                                 model_output.logits.size(1));
         for (const auto& stream : all_streams) {
-            RTP_LLM_CHECK(stream->vocabSize() == real_vocab_size);
+            RTP_LLM_CHECK((stream->outputVocabSize() > 0 ? stream->outputVocabSize() : stream->vocabSize())
+                          == real_vocab_size);
         }
         RTP_LLM_CHECK(model_batch_idx == static_cast<size_t>(model_output.logits.size(0)));
 
@@ -238,6 +239,7 @@ void NormalSamplerInputGatherer::fillSamplerCommonInputs(SamplerInputs&         
                    cum_log_probs.numel() * sizeof(float));
         }
         for (int i = 0; i < sampler_batch_size; ++i) {
+            const bool no_sample_chunk = !score_batch && stream->isMiddleChunk();
             input_lengths[batch_idx]      = stream->inputLength();
             sequence_lengths[batch_idx]   = stream->seqLength() + (score_batch ? i : propose_step);
             num_beams_in[batch_idx]       = stream->currentNumBeams();
@@ -248,14 +250,15 @@ void NormalSamplerInputGatherer::fillSamplerCommonInputs(SamplerInputs&         
             repetition_penalty[batch_idx] = stream->generateConfig()->repetition_penalty;
             presence_penalty[batch_idx]   = stream->generateConfig()->presence_penalty;
             frequency_penalty[batch_idx]  = stream->generateConfig()->frequency_penalty;
-            do_sample[batch_idx]          = stream->generateConfig()->do_sample;
+            // Middle chunk output is discarded; avoid advancing the request RNG.
+            do_sample[batch_idx]          = stream->generateConfig()->do_sample && !no_sample_chunk;
             if (!do_sample[batch_idx]) {
                 top_k[batch_idx]       = 1;
                 top_p[batch_idx]       = 1;
                 temperature[batch_idx] = 1;
             }
             no_repeat_ngram_size[batch_idx]     = stream->generateConfig()->no_repeat_ngram_size.value_or(0);
-            sampler_inputs.generator[batch_idx] = stream->getGenerator();
+            sampler_inputs.generator[batch_idx] = no_sample_chunk ? at::Generator() : stream->getGenerator();
             batch_idx += 1;
         }
     }

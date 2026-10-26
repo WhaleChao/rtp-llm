@@ -243,6 +243,13 @@ MtpTargetLogprobs computeMtpTargetLogprobs(const torch::Tensor&        logits,
                                            int64_t                     real_vocab_size,
                                            const std::vector<int64_t>& source_row_indices) {
     auto result = captureMtpTargetLogprobs(logits, max_top_logprobs, real_vocab_size, source_row_indices);
+    // Sampling may modify the model logits in place after these statistics are
+    // computed. Sparse capture already copies rows; identity capture needs its
+    // own snapshot so selected-token logits and statistics describe one state.
+    if (result.retains_full_lm_head_storage) {
+        result.raw_logits = result.raw_logits.clone();
+        result.retains_full_lm_head_storage = false;
+    }
     computeMtpTargetLogprobRowStatistics(result);
     return result;
 }

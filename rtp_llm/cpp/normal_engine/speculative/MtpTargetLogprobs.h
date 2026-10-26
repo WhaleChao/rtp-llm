@@ -81,11 +81,14 @@ MtpTargetLogprobs captureMtpTargetLogprobs(const torch::Tensor&        logits,
                                            int64_t                     real_vocab_size,
                                            const std::vector<int64_t>& captured_dense_row_indices = {});
 
+// Computes statistics and owns an independent raw-logit snapshot so in-place
+// sampling transforms cannot invalidate selected-token logprobs.
 MtpTargetLogprobs computeMtpTargetLogprobs(const torch::Tensor&        logits,
                                            int64_t                     max_top_logprobs,
                                            int64_t                     real_vocab_size,
                                            const std::vector<int64_t>& source_row_indices = {});
 
+// Any override must contain the same unmodified raw values used for statistics.
 void finalizeMtpTargetLogprobs(MtpTargetLogprobs&   target_logprobs,
                                const torch::Tensor& emitted_token_ids,
                                const torch::Tensor& raw_logits_override = torch::Tensor());

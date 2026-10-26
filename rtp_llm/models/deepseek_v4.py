@@ -529,7 +529,7 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
                 # ``last_hidden`` to match, dispatching to a f32 simt sgemm
                 # (``cutlass3x_sm100_simt_sgemm_f32_f32_f32_f32_f32`` — CUDA
                 # cores, ~2.3 ms / decode step at bs=128 / vocab=129280 on
-                # B300) instead of the bf16 tensor-core path (~0.1 ms).
+                # SM103) instead of the bf16 tensor-core path (~0.1 ms).
                 # ``None`` falls through to ``load_config.compute_dtype`` in
                 # AtomicWeight._load_raw_tensor (i.e. bf16 for V4), keeping
                 # the ckpt dtype.
@@ -679,13 +679,15 @@ class DeepSeekV4(DeepSeekV2):
         )
 
     @staticmethod
-    def _from_hf(config: ModelConfig, ckpt_path: str):  # noqa: C901  (acceptably long)
+    def _from_hf(
+        config: ModelConfig, ckpt_path: str, config_json=None
+    ):  # noqa: C901  (acceptably long)
         config_path = os.path.join(ckpt_path, "config.json")
-        if not os.path.exists(config_path):
-            return
-
-        with open(config_path) as reader:
-            config_json = json.loads(reader.read())
+        if config_json is None:
+            if not os.path.exists(config_path):
+                return
+            with open(config_path) as reader:
+                config_json = json.loads(reader.read())
 
         # ---- basic geometry ----
         config.num_layers = config_json["num_hidden_layers"]

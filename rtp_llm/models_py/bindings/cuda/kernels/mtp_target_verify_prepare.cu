@@ -275,6 +275,8 @@ __global__ void mtpRowLogSoftmaxStatsKernel(const scalar_t* __restrict__ logits,
     }
 
     const float row_max = reduction[0];
+    // All warps must consume the maximum before the sum reuses this storage.
+    __syncthreads();
     if (row_max == CUDART_INF_F || row_max == -CUDART_INF_F) {
         if (threadIdx.x == 0) {
             row_max_output[row]        = row_max;
@@ -487,6 +489,8 @@ __global__ void mtpSelectedRowLogProbsKernel(const scalar_t* __restrict__ logits
 
     const float row_max     = reduction_values[0];
     const bool  row_has_nan = nan_flags[0] != 0;
+    // The next reduction overwrites the maximum read by every warp.
+    __syncthreads();
     float       row_shifted_logsumexp;
     if (row_has_nan) {
         row_shifted_logsumexp = CUDART_NAN_F;
@@ -517,6 +521,8 @@ __global__ void mtpSelectedRowLogProbsKernel(const scalar_t* __restrict__ logits
             (static_cast<float>(row_logits[emitted_token_id]) - row_max) - row_shifted_logsumexp;
     }
 
+    // Top-k reuses reduction_values after all warps consume the normalizer.
+    __syncthreads();
     if constexpr (LOCAL_TOP_K > 0) {
         int local_cursor = 0;
         for (int rank = 0; rank < top_k; ++rank) {

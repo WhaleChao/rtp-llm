@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <cassert>
-#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -22,7 +21,6 @@
 
 namespace rtp_llm {
 
-class RtpLLMCacheReuseMetricsCollector;
 class CPSlotMapper;
 class CacheStore;
 class BroadcastManager;
@@ -61,6 +59,7 @@ public:
     MallocResult malloc(const MallocInfo& malloc_info);
     void         free(const FreeInfo& free_info);
     bool         abortPendingLoad(const std::shared_ptr<AsyncContext>& context);
+    bool         detachSharedBlocksForRecompute(const BatchKVCacheResourcePtr& resource, int device_ready_reuse_length);
     // Outputs the resident key-prefix count; ordinary inserts report zero.
     void insertIntoCache(const InsertInfo& insert_info, size_t& resident_prefix_length);
 
@@ -88,6 +87,7 @@ public:
     void blockBatchCopy(const torch::Tensor& copy_mapping);
     void blockBatchCopy(const BlockIdPair* copy_mapping_begin, const BlockIdPair* copy_mapping_end);
     void blockBatchCopyByGroup(const std::vector<TaggedBlockIdPair>& copy_mapping);
+    void blockBatchCopyForForward(const torch::Tensor& copy_mapping, const std::vector<std::string>& group_tags);
 
     bool updateKVBlock(const BatchKVCacheResourcePtr&  batch_kv_cache_resource,
                        const std::vector<int>&         block_src_batch,
@@ -119,13 +119,10 @@ public:
     size_t      totalBlocksNum() const;
     size_t      maxAvailableTokensNum() const;
     KVCacheInfo getKVCacheInfo(int64_t latest_version, bool need_cache_keys) const;
-    void        refreshKVCacheInfoSnapshot();
-    KVCacheInfo buildKVCacheInfo(int64_t latest_version, bool need_cache_keys) const;
 
     // 系统资源管理
     void regUserMr(size_t model_id, std::shared_ptr<CacheStore> cache_store = nullptr);
     void stopMetricsReporter();
-    void recordCacheHitTokens(int64_t input_length, const RtpLLMCacheReuseMetricsCollector& metrics);
 
     // CacheStore ownership (set by RemoteRpcServer, read during model forward)
     void                        setCacheStore(std::shared_ptr<CacheStore> cache_store);
@@ -154,7 +151,6 @@ public:
 private:
     std::function<void()> allocationChangeCallback() const;
     void                  reportMetricsLoop();
-    bool collectCacheHitRates(std::chrono::steady_clock::time_point now, RtpLLMCacheReuseMetricsCollector& metrics);
     void reportPrefillCacheHitMetrics(const MallocInfo& malloc_info, bool is_first_malloc);
     std::shared_ptr<BroadcastManager> createMultiRankBlockTransferManager() const;
 
@@ -178,22 +174,11 @@ private:
     std::shared_ptr<CPSlotMapper>                   cp_slot_mapper_;
     std::unique_ptr<PrefillCacheHitMetricsReporter> prefill_cache_hit_metrics_reporter_;
 
-    std::mutex                            cache_hit_mutex_;
-    std::chrono::steady_clock::time_point cache_hit_window_start_  = std::chrono::steady_clock::now();
-    int64_t                               cache_hit_input_tokens_  = 0;
-    int64_t                               cache_hit_reuse_tokens_  = 0;
-    int64_t                               cache_hit_device_tokens_ = 0;
-    int64_t                               cache_hit_host_tokens_   = 0;
-    int64_t                               cache_hit_disk_tokens_   = 0;
-
     std::atomic<bool> stop_{false};
     std::thread       metrics_reporter_thread_;
 
     BlockTreeCachePtr                           block_tree_cache_;
     std::shared_ptr<KVCacheAllocationWaitState> allocation_wait_state_;
-
-    mutable std::mutex                 cache_status_snapshot_mutex_;
-    std::shared_ptr<const KVCacheInfo> cache_status_snapshot_;
 
     mutable std::mutex          cache_store_mutex_;
     std::shared_ptr<CacheStore> cache_store_;

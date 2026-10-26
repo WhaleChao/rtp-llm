@@ -1,19 +1,50 @@
 import logging
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 
-from rtp_llm.models_py.utils.arch import is_cuda, get_sm
-
-if is_cuda() and get_sm()[0] >= 10:
-    from rtp_llm.ops.compute_ops import (
-        cutlass_scaled_fp4_mm,
-        scaled_fp4_quant,
-    )
-else:
-    logging.info("skip import fp4 kernel from rtp_llm_ops for non cuda platform")
+from rtp_llm.models_py.utils.arch import get_sm, is_cuda
 
 logger = logging.getLogger(__name__)
+
+_NVFP4_READY = False
+_NVFP4_IMPORT_ERROR = None
+
+if is_cuda() and get_sm()[0] >= 10:
+    try:
+        from rtp_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
+
+        _NVFP4_READY = True
+    except ImportError as exc:
+        # `rtp_kernel.nvfp4` only ships in the cuda13 rtp-kernel wheel pinned
+        # by deps/requirements_lock_torch_gpu_cuda13.txt.  A stale wheel stays
+        # importable (`import rtp_kernel` succeeds) while missing the
+        # submodule, and the CUDA linear registration imports fp4_linear
+        # *before* registering the FP8 backends -- so an eager failure here
+        # silently unregisters FP8 as well.  Keep this module importable and
+        # raise a clear error from the wrappers instead.
+        _NVFP4_IMPORT_ERROR = exc
+        logging.warning(
+            "rtp_kernel.nvfp4 unavailable (%s); FP4 kernels will raise on use",
+            exc,
+        )
+else:
+    logging.info("skip import fp4 kernel from rtp_kernel.nvfp4 for non cuda platform")
+
+
+def _require_nvfp4() -> None:
+    if _NVFP4_READY:
+        return
+    if _NVFP4_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "rtp_kernel.nvfp4 is unavailable in this environment "
+            f"({_NVFP4_IMPORT_ERROR}); install the cuda13 rtp-kernel wheel "
+            "pinned by deps/requirements_lock_torch_gpu_cuda13.txt"
+        )
+    raise RuntimeError(
+        "rtp_kernel.nvfp4 is only available on CUDA devices with sm >= 10"
+    )
+
 
 def cutlass_scaled_fp4_mm_wrapper(
     a: torch.Tensor,
@@ -23,68 +54,13 @@ def cutlass_scaled_fp4_mm_wrapper(
     alpha: torch.Tensor,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    assert a.ndim == 2 and b.ndim == 2
-    m, n = a.shape[0], b.shape[0]
-    out = torch.empty((m, n), dtype=out_dtype, device=a.device)
-    cutlass_scaled_fp4_mm(
-        out, a, b, block_scale_a, block_scale_b, alpha
-    )
-    return out
+    _require_nvfp4()
+    return cutlass_scaled_fp4_mm(a, b, block_scale_a, block_scale_b, alpha, out_dtype)
+
 
 def scaled_fp4_quant_wrapper(
     input: torch.Tensor, input_global_scale: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize input tensor to FP4 and return quantized tensor and scale.
-
-    This function quantizes the last dimension of the given tensor `input`. For
-    every 16 consecutive elements, a single dynamically computed scaling factor
-    is shared. This scaling factor is quantized using the `input_global_scale`
-    and is stored in a swizzled layout (see
-    https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-b-layout-4x).
-
-    Args:
-        input: The input tensor to be quantized to FP4
-        input_global_scale: A scalar scaling factor for the entire tensor.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: The output tensor in FP4 but every
-            two values are packed into a uint8 and float8_e4m3 scaling factors
-            in a sizzled layout.
-    """
-    assert input.ndim >= 1, f"input.ndim needs to be >= 1, but got {input.ndim}."
-    other_dims = 1 if input.ndim == 1 else -1
-    input = input.reshape(other_dims, input.shape[-1])
-    m, n = input.shape
-    block_size = 16
-    device = input.device
-
-    assert n % block_size == 0, f"last dim has to be multiple of 16, but got {n}."
-    assert input.dtype in (
-        torch.float16,
-        torch.bfloat16,
-    ), f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
-
-    # Two fp4 values will be packed into an uint8.
-    output = torch.empty((m, n // 2), device=device, dtype=torch.uint8)
-
-    # We use the rounded values to store the swizzled values. Then, the scaling
-    # factors in float8_e4m3fn are packed into an int32 for every 4 values.
-    rounded_m = ((m + 128 - 1) // 128) * 128
-    scale_n = n // block_size
-    rounded_n = ((scale_n + 4 - 1) // 4) * 4
-    # padded part should be zeroed out
-    if rounded_n > scale_n:
-        output_scale = torch.zeros(
-            (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
-        )
-    else:
-        output_scale = torch.empty(
-            (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
-        )
-
-    scaled_fp4_quant(
-        output, input, output_scale, input_global_scale
-    )
-    output_scale = output_scale.view(torch.float8_e4m3fn)
-    return output, output_scale
+    """Quantize the last dim to NVFP4 with swizzled UE4M3 scales."""
+    _require_nvfp4()
+    return scaled_fp4_quant(input, input_global_scale)

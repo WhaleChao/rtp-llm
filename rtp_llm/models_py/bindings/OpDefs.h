@@ -103,6 +103,9 @@ public:
         return static_cast<int>(grouped_layout_.topology().group(tag).kernelSeqSizePerBlock());
     }
 
+    // Entry count of the exposed layer-cache view; zero for non-opaque specs.
+    size_t getEntriesPerBlock(const std::string& tag) const;
+
 private:
     void validateLayer(int layer_id) const {
         if (layer_id < 0 || static_cast<size_t>(layer_id) >= layerCount()) {
@@ -239,6 +242,7 @@ struct PyCacheStoreInputs {
     // Eligible non-warmup PD-prefill work item, filtered by PyWrappedModel before entering Python.
     torch::Tensor input_lengths_host;     // int32, [decoder + context]
     torch::Tensor prefix_lengths_host;    // int32, [context]
+    torch::Tensor publish_start_tokens;   // CPU int32, [context]; required for nonempty Prefill writes
     torch::Tensor host_kv_cache_offset;   // int32, [batch, tag-local blocks]
     torch::Tensor request_id;             // int64, [context]
     torch::Tensor request_pd_separation;  // bool, [context]
@@ -256,6 +260,9 @@ struct PyPrefillCudaGaphCopyParams {
 };
 
 struct PyContextParallelParams {
+    torch::Tensor prefill_qkv_restore_indice_cpu;
+    torch::Tensor prefill_qkv_padding_mask_cpu;
+    torch::Tensor prefill_mm_spans;
     torch::Tensor prefill_cp_padding_lengths;
     torch::Tensor prefill_cp_chunk_lengths;
     torch::Tensor prefill_shuffle_indices;
@@ -329,6 +336,7 @@ struct PyEmbeddingInputs {
 };
 
 struct PyMultimodalInputs {
+    torch::Tensor              mm_features_spans;
     std::vector<torch::Tensor> multimodal_features;
     torch::Tensor              mm_features_locs;
     std::vector<torch::Tensor> mm_extra_input;
@@ -347,6 +355,12 @@ struct PyModelInputs {
     PyAttentionInputs    attention_inputs;
     AttentionInputsByTag attention_inputs_by_tag;
     BertEmbeddingInputs  bert_embedding_inputs;
+    torch::Tensor        engram_token_windows;
+    bool                 need_all_logits        = true;
+    bool                 need_all_hidden_states = true;
+
+    // Internal homogeneous-batch signal; not part of the Generate RPC/config surface.
+    bool capture_hidden_states = false;
 
     bool hasAttentionInputsByTag() const {
         return !attention_inputs_by_tag.empty();

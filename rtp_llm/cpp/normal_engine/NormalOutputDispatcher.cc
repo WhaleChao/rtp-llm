@@ -263,10 +263,12 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
         RTP_LLM_CHECK(!expected_raw_row_indices.empty());
         RTP_LLM_CHECK(!requested_output_row_indices.empty());
 
-        const int64_t real_vocab_size = all_streams.front()->vocabSize();
+        const auto output_vocab_size = all_streams.front()->outputVocabSize();
+        const int64_t real_vocab_size = output_vocab_size > 0 ? output_vocab_size : all_streams.front()->vocabSize();
         RTP_LLM_CHECK(real_vocab_size > 0);
         for (const auto& stream : all_streams) {
-            RTP_LLM_CHECK(stream->vocabSize() == real_vocab_size);
+            RTP_LLM_CHECK((stream->outputVocabSize() > 0 ? stream->outputVocabSize() : stream->vocabSize())
+                          == real_vocab_size);
         }
 
         torch::Tensor raw_logits      = sampler_output.raw_logprobs_logits;
@@ -366,8 +368,13 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
             auto input_top_logprobs = (std::get<0>(topk_result).to(torch::kFloat32) - row_max.unsqueeze(1))
                                       - row_shifted_logsumexp.unsqueeze(1);
             compact_top_logprobs = input_top_logprobs.index_select(0, output_to_compact).unsqueeze(1).contiguous();
-            compact_top_logprob_token_ids =
-                std::get<1>(topk_result).to(torch::kInt32).index_select(0, output_to_compact).unsqueeze(1).contiguous();
+            auto top_token_ids = std::get<1>(topk_result).index_select(0, output_to_compact);
+            if (!output_vocab_ids_.empty()) {
+                RTP_LLM_CHECK(static_cast<int64_t>(output_vocab_ids_.size()) == real_vocab_size);
+                auto canonical_ids = make_device_index(output_vocab_ids_, raw_logits.device());
+                top_token_ids = canonical_ids.index_select(0, top_token_ids.reshape({-1})).reshape(top_token_ids.sizes());
+            }
+            compact_top_logprob_token_ids = top_token_ids.to(torch::kInt32).unsqueeze(1).contiguous();
         } else {
             const int64_t requested_output_count = static_cast<int64_t>(requested_output_row_indices.size());
             compact_top_logprobs =
