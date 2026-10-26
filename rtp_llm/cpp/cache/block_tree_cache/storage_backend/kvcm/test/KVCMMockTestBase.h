@@ -251,6 +251,7 @@ struct MatchObservation {
     size_t                                   matched_blocks_num{0};
     std::shared_ptr<StorageBackendMatchMeta> match_meta;
     bool                                     success{false};
+    PrefixCacheRemoteQueryStatus             query_status{PrefixCacheRemoteQueryStatus::UNSET};
 };
 
 template<typename T>
@@ -425,8 +426,9 @@ environmentBuffers(const BackendEnvironment& environment, int layer, const std::
         std::move(request),
         [promise](size_t matched_blocks_num,
                   std::shared_ptr<StorageBackendMatchMeta> match_meta,
-                  bool success) {
-            promise->set_value({matched_blocks_num, std::move(match_meta), success});
+                  bool success,
+                  PrefixCacheRemoteQueryStatus query_status) {
+            promise->set_value({matched_blocks_num, std::move(match_meta), success, query_status});
         });
     return await(future);
 }

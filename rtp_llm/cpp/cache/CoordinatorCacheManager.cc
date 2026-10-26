@@ -46,6 +46,51 @@ bool hasDenseSwaStorage(const GroupBase& group) {
                || group.spec->type == KVCacheSpecType::MultiHeadLatentAttention);
 }
 
+std::vector<std::vector<int>> makePrefixTokenSegments(const CacheConfig&                config,
+                                                     const CacheKeysType&              cache_keys,
+                                                     const std::vector<int>&           tokens,
+                                                     const std::vector<GroupSetPtr>&   group_sets) {
+    if (tokens.empty() || cache_keys.empty()) {
+        return {};
+    }
+    std::string boundary_tag;
+    for (const GroupSetPtr& group_set : group_sets) {
+        if (group_set != nullptr && group_set->groupType() == CacheGroupType::FULL
+            && !group_set->groupTags().empty()) {
+            boundary_tag = group_set->groupTags().front();
+            break;
+        }
+    }
+    if (boundary_tag.empty()) {
+        for (const GroupSetPtr& group_set : group_sets) {
+            if (group_set != nullptr && !group_set->groupTags().empty()) {
+                boundary_tag = group_set->groupTags().front();
+                break;
+            }
+        }
+    }
+    if (boundary_tag.empty()) {
+        return {};
+    }
+
+    const size_t token_unit =
+        config.cache_key_layout_resolved ? config.reuse_unit_tokens : config.seq_size_per_block;
+    std::vector<std::vector<int>> segments(cache_keys.size());
+    for (size_t key_index = 0; key_index < cache_keys.size(); ++key_index) {
+        const size_t start = std::min(config.canonicalBlockPosition(boundary_tag, key_index) * token_unit,
+                                      tokens.size());
+        const size_t end = key_index + 1 == cache_keys.size() ?
+                               tokens.size() :
+                               std::min(config.canonicalBlockPosition(boundary_tag, key_index + 1) * token_unit,
+                                        tokens.size());
+        if (end > start) {
+            segments[key_index].assign(tokens.begin() + static_cast<std::ptrdiff_t>(start),
+                                       tokens.begin() + static_cast<std::ptrdiff_t>(end));
+        }
+    }
+    return segments;
+}
+
 int resolvedGroupTokens(const CacheConfig& config, std::string_view tag, bool common, int raw_tokens) {
     // STATE request endpoints use the absolute token cursor. It is a ring
     // coordinate request, not a rank-local allocation length.
@@ -83,7 +128,8 @@ int requestIncrSeqLength(const MallocInfo& info) {
 }
 
 int requestCommonSeqLength(const MallocInfo& info) {
-    return info.request_layout ? info.request_layout->request_common_seq_len : info.complete_token_ids->commonSeqLength();
+    return info.request_layout ? info.request_layout->request_common_seq_len
+                                : info.complete_token_ids->commonSeqLength();
 }
 
 int requestTotalSeqLength(const MallocInfo& info) {
@@ -545,13 +591,14 @@ size_t CoordinatorCacheManager::loadTargetEndpoint(size_t token_end, const std::
 
 std::shared_ptr<LoadAsyncContext> CoordinatorCacheManager::prepareKVCache(
     const CacheKeysType& cache_keys, BatchKVCacheResource& kv_resource, PreparedKVCache& prepared,
-    const std::function<bool(size_t)>& valid_prefix,
+    const std::function<bool(size_t)>& valid_prefix, const std::vector<int>* request_tokens,
     const PartialTailMatchRequest* partial_tail) {
     if (!block_tree_cache_ || (cache_keys.empty() && partial_tail == nullptr)) {
         return nullptr;
     }
-    BlockTreeMatchResult match_result = block_tree_cache_->match(cache_keys, valid_prefix, partial_tail);
+    BlockTreeMatchResult match_result = block_tree_cache_->match(cache_keys, valid_prefix, request_tokens, partial_tail);
     prepared.farthest_fork    = match_result.farthest_fork;
+    prepared.match_observation = match_result.match_observation;
     std::shared_ptr<LoadAsyncContext> load_context = std::move(match_result.async_context);
     prepared.matched_device_blocks                 = match_result.matched_device_blocks;
     prepared.matched_device_endpoint               = match_result.matched_device_endpoint;
@@ -634,6 +681,10 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
     prepared.referenced_blocks.resize(kv_cache_groups_.size());
     std::shared_ptr<LoadAsyncContext> load_context;
 
+    const std::vector<int>* request_tokens =
+        malloc_info.request_layout && !malloc_info.request_layout->token_ids.empty() ?
+            &malloc_info.request_layout->token_ids :
+            nullptr;
     if (malloc_info.enable_cache_lookup) {
         CacheKeysType match_keys = config_.canonicalCacheKeys(
             malloc_info.request_layout ? malloc_info.request_layout->match_keys : cache_keys);
@@ -645,8 +696,6 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
                    static_cast<int>(match_keys.size()) * reuse_unit_tokens, config_.cache_min_replay_tokens)) {
             match_keys.pop_back();
         }
-        const std::vector<int>* request_tokens = malloc_info.request_layout ?
-            &malloc_info.request_layout->token_ids : nullptr;
         PartialTailMatchRequest partial_tail;
         const bool use_partial_tail = malloc_info.request_layout && malloc_info.request_layout->partial_tail_reuse
                                       && request_tokens != nullptr
@@ -706,9 +755,13 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
                            [tokens = malloc_info.complete_token_ids, reuse_unit_tokens](size_t count) {
                                return tokens->isValidReuseLength(static_cast<int>(count) * reuse_unit_tokens);
                            },
+                           request_tokens,
                            use_partial_tail ? &partial_tail : nullptr);
         match_end_time_us  = currentTimeUs();
         match_cost_time_us = match_end_time_us - begin_us;
+        if (prepared.match_observation.has_value()) {
+            prepared.match_observation->match_time_us = match_cost_time_us;
+        }
         load_attempted     = load_context != nullptr;
         kv_resource->cacheResource(0).setDeviceReuseBlockNum(
             prepared.precise_local ? prepared.matched_device_endpoint / reuse_tokens : prepared.matched_device_blocks);
@@ -725,6 +778,7 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
         result.match_cost_time_us = match_cost_time_us;
         result.match_end_time_us  = match_end_time_us;
         result.load_attempted     = load_attempted;
+        result.match_observation  = prepared.match_observation;
         if (prepared.materialize_status != MallocStatus::NONE) {
             result.status = prepared.materialize_status;
         }
@@ -732,6 +786,7 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
     };
 
     if (load_context && load_context->needBackendMatch()) {
+        auto match_observation = prepared.match_observation;
         auto deferred_prepared = std::make_shared<PreparedKVCache>(std::move(prepared));
         // Keeping shared_from_this() in the context can destroy this allocator
         // and its task pool on that pool's own settlement worker. Destruction
@@ -748,6 +803,7 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
                             load_context};
         result.match_end_time_us = match_end_time_us;
         result.load_attempted    = load_attempted;
+        result.match_observation = std::move(match_observation);
         result.farthest_fork      = deferred_prepared->farthest_fork;
         return result;
     }
@@ -763,6 +819,7 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
         load_context};
     result.match_end_time_us = match_end_time_us;
     result.load_attempted    = load_attempted;
+    result.match_observation = prepared.match_observation;
     result.farthest_fork      = prepared.farthest_fork;
     return result;
 }
@@ -1680,6 +1737,8 @@ void CoordinatorCacheManager::publishRegisteredSpineAndFork(const InsertInfo&   
                                                              size_t&                        resident_prefix_length) {
     // The T05 owner completion signal is stronger than populated block IDs.
     if (!registration.prepared || !registration.content_completed || registration.original_input_tokens == 0) {
+        block_tree_cache_->observePublicationSkipped(insert_info.observation_request_id, insert_info.target_tier,
+                                                     "registration_not_complete");
         return;
     }
     const size_t unit = config_.cache_key_layout_resolved ? config_.reuse_unit_tokens :
@@ -1785,7 +1844,12 @@ void CoordinatorCacheManager::publishRegisteredSpineAndFork(const InsertInfo&   
                                                              Tier::DEVICE,
                                                              insert_info.is_resident,
                                                              &token_segments,
-                                                             &token_ends);
+                                                             insert_info.prefix_plan_state,
+                                                             &token_ends,
+                                                             insert_info.observation_request_id);
+    } else {
+        block_tree_cache_->observePublicationSkipped(insert_info.observation_request_id, insert_info.target_tier,
+                                                     "no_publishable_full_prefix");
     }
     const auto fork_it = std::find_if(registration.points.begin(), registration.points.end(),
                                       [](const auto& point) { return point.internal_only; });
@@ -1835,8 +1899,15 @@ void CoordinatorCacheManager::publishRegisteredSpineAndFork(const InsertInfo&   
                                       Tier::DEVICE,
                                       false,
                                       &fork_segments,
+                                      nullptr,
                                       &fork_ends,
+                                      insert_info.observation_request_id,
                                       true);
+        } else {
+            block_tree_cache_->observePublicationSkipped(insert_info.observation_request_id,
+                                                         Tier::DEVICE,
+                                                         "internal_fork_missing_ancestor_or_group",
+                                                         fork_it->endpoint.pos);
         }
     }
 }
@@ -1934,22 +2005,33 @@ void CoordinatorCacheManager::publishLegacyBatches(const InsertInfo&     insert_
         }
         insert_keys.resize(publish_prefix);
         resources.resize(publish_prefix);
+        std::vector<std::vector<int>> token_segments;
+        if (block_tree_cache_->prefixObservabilityEnabled() && insert_info.complete_token_ids != nullptr) {
+            token_segments = makePrefixTokenSegments(config_,
+                                                     insert_keys,
+                                                     insert_info.complete_token_ids->completeTokenIdsVec(batch_id),
+                                                     block_tree_cache_->groupSets());
+        }
         if (insert_info.is_resident) {
             const size_t batch_resident_prefix_length =
                 block_tree_cache_->insert(insert_keys,
                                           resources,
                                           insert_info.target_tier,
                                           true,
+                                          &token_segments,
+                                          insert_info.prefix_plan_state,
                                           nullptr,
-                                          nullptr);
+                                          insert_info.observation_request_id);
             resident_prefix_length += batch_resident_prefix_length;
         } else {
             block_tree_cache_->insert(insert_keys,
                                           resources,
                                           insert_info.target_tier,
                                           false,
+                                          &token_segments,
+                                          insert_info.prefix_plan_state,
                                           nullptr,
-                                          nullptr);
+                                          insert_info.observation_request_id);
         }
     }
 }

@@ -768,7 +768,7 @@ void NormalEngineTest::checkInternalForkHistoryCopy(bool        invalid_row,
         // The public cache insertion path also registers eviction candidates.
         // A raw tree insertion alone cannot be reclaimed by evictForGroup.
         manager->blockTreeCache()->insert(
-            source_keys, source_resources, Tier::DEVICE, false, &source_segments, &source_ends);
+            source_keys, source_resources, Tier::DEVICE, false, &source_segments, nullptr, &source_ends);
         ASSERT_EQ(tree->findNode(source_keys).size(), 3u);
     } else {
         ASSERT_EQ(
@@ -809,8 +809,10 @@ void NormalEngineTest::checkInternalForkHistoryCopy(bool        invalid_row,
             backend->match(request,
                            [completion](size_t count,
                                         std::shared_ptr<StorageBackendMatchMeta>,
-                                        bool success) {
-                               completion->set_value(success && count == 1);
+                                        bool                         success,
+                                        PrefixCacheRemoteQueryStatus status) {
+                               completion->set_value(success && count == 1
+                                                     && status == PrefixCacheRemoteQueryStatus::HIT);
                            });
             ASSERT_EQ(future.wait_until(deadline), std::future_status::ready);
             committed = future.get();
@@ -923,8 +925,9 @@ void NormalEngineTest::checkInternalForkHistoryCopy(bool        invalid_row,
         backend->match(request,
                        [completion](size_t count,
                                     std::shared_ptr<StorageBackendMatchMeta>,
-                                    bool success) {
-                           completion->set_value(success && count == 1);
+                                    bool                         success,
+                                    PrefixCacheRemoteQueryStatus status) {
+                           completion->set_value(success && count == 1 && status == PrefixCacheRemoteQueryStatus::HIT);
                        });
         ASSERT_EQ(future.wait_for(std::chrono::seconds(60)), std::future_status::ready);
         ASSERT_TRUE(future.get());

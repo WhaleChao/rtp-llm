@@ -504,7 +504,7 @@ TEST_F(SingleTypeCoordinatorCacheManagerTest, FullRuntimeAliasSurvivesBeamDropAn
     partial.endpoint_key      = [&](size_t endpoint) {
         return cacheKeyAtTokenEnd(*tokens, 0, 4, static_cast<int>(endpoint));
     };
-    auto matched = allocator_->blockTreeCacheOwner()->match(runtime->cacheKeys(0), {}, &partial);
+    auto matched = allocator_->blockTreeCacheOwner()->match(runtime->cacheKeys(0), {}, nullptr, &partial);
     ASSERT_EQ(matched.matched_device_endpoint, 7u);
     ASSERT_EQ(matched.matched_device_resources.size(), 1u);
     ASSERT_EQ(matched.matched_device_resources.front().node_blocks.back().second, BlockIndicesType{original});
@@ -640,7 +640,8 @@ TEST_F(SingleTypeCoordinatorCacheManagerTest, RejectedInternalForkReleasesOption
     const std::vector<std::vector<int>> segments{{1, 2, 3, 4}, {5, 6, 7}};
     const std::vector<size_t> ends{4, 7};
     bool ready = true;
-    cache->insert({11, 22}, resources, Tier::DEVICE, false, &segments, &ends, true, &ready);
+    cache->insert({11, 22}, resources, Tier::DEVICE, false, &segments, nullptr, &ends,
+                  std::nullopt, true, &ready);
     EXPECT_FALSE(ready);
     EXPECT_TRUE(cache->tree()->findNode({11, 22}).empty());
     for (size_t id = 0; id < groups.size(); ++id) {
