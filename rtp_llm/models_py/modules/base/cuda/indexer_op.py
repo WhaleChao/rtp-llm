@@ -918,13 +918,9 @@ class IndexerOp(nn.Module):
             "not CUDA-graph safe"
         )
 
-        # Gather quantized key from cache for prefill.
-        # total_kv_tokens = sum(input_lengths + prefix_lengths) across all
-        # requests — this is the number of K rows that
-        # cp_gather_indexer_k_quant_cache will write (governed by cu_kv_seqlens_device).
-        # Using q_fp8.shape[0] (= sum(input_lengths)) is wrong when
-        # prefix_lengths > 0 (e.g. target-verify in speculative decoding).
-        total_kv_tokens = fmha_params.prefill_total_kv_tokens
+        # The shared attention metadata includes history before this chunk;
+        # Q contains only the current window.
+        total_kv_tokens = attention_inputs.context_total_kv_length
         k_fp8 = torch.empty(
             (total_kv_tokens, self.index_head_dim),
             dtype=torch.float8_e4m3fn,

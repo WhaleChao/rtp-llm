@@ -147,7 +147,6 @@ void SparseMlaParams::fillParamsInternal(bool                 is_prefill,
             }
             k_offset += kv_len;
         }
-        prefill_total_kv_tokens = k_offset;
     }
 }
 
@@ -717,7 +716,6 @@ void registerPySparseMlaParams(pybind11::module& m) {
         .def_readonly("multi_token_decode_total_tokens", &SparseMlaParams::multi_token_decode_total_tokens_)
         .def_readonly("target_verify_total_tokens", &SparseMlaParams::multi_token_decode_total_tokens_)
         .def_readonly("prefill_tokens_per_batch", &SparseMlaParams::prefill_tokens_per_batch_)
-        .def_readonly("prefill_total_kv_tokens", &SparseMlaParams::prefill_total_kv_tokens)
         .def_readonly("prefill_max_kv_len", &SparseMlaParams::prefill_max_kv_len)
         .def_readwrite("schedule_metadata", &SparseMlaParams::schedule_metadata)
         .def(

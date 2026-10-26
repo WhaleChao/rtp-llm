@@ -87,14 +87,12 @@ public:
                                             torch::Tensor kv_cache_block_id_device,
                                             int           seq_size_per_block);
 
-    // SparseMlaParams-specific outputs (5 parameters)
+    // SparseMlaParams-specific ragged indexer metadata.
     torch::Tensor expanded_seq_lens;
     torch::Tensor topk_indices_offset;
     torch::Tensor ks;
     torch::Tensor ke;
 
-    // total KV tokens for prefill ragged buffer allocation
-    int64_t prefill_total_kv_tokens = 0;
     // Maximum request-local KV length. This is prepared from the existing CPU
     // length metadata and lets ragged kernels choose Register vs Streaming
     // without a device-to-host reduction.

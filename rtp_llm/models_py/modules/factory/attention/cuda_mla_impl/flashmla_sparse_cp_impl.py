@@ -422,27 +422,19 @@ class SparseMlaFp8CPOp(SparseMlaFp8Op):
             1,
             True,
         )
-        if self._fp8_kernel_metadata_q0 is None:
-            tile_sched_q0, num_splits_q0 = get_mla_metadata(  # type: ignore
-                cache_seqlens=None,
-                num_q_tokens_per_head_k=key[0],
-                topk=self.top_k,
-                num_heads_q=self.num_heads,
-                num_heads_k=1,
-                is_fp8_kvcache=True,
-            )
-            self._fp8_kernel_metadata_q0 = SparseMlaFp8DecodeParams(
-                tile_sched_q0, num_splits_q0
-            )
-            self._fp8_kernel_metadata_q0_key = key
-            return
-
-        if self.use_cuda_graph:
+        if self.use_cuda_graph and self._fp8_kernel_metadata_q0_key is not None:
             if self._fp8_kernel_metadata_q0_key != key:
                 raise RuntimeError(
                     "CP sparse MLA CUDA graph replay changed scheduler shape: "
                     f"captured={self._fp8_kernel_metadata_q0_key}, current={key}"
                 )
+            return
+
+        # A chunk tail can leave a CP rank with padding only. Such ranks still
+        # exchange KV, but must not initialize an attention scheduler for zero Q.
+        if n_q == 0:
+            self._fp8_kernel_metadata_q0 = None
+            self._fp8_kernel_metadata_q0_key = key
             return
 
         tile_sched_q0, num_splits_q0 = get_mla_metadata(  # type: ignore
