@@ -747,7 +747,9 @@ bool KVCacheManager::executeFunction(const FunctionRequestPB& request, FunctionR
         return true;
     }
     if (descriptors.empty()) {
-        memory_response->set_code(MemoryOperationResponsePB::OK);
+        TransferResult result;
+        result.expandBlockErrors(request.mem_request().copy_items_size());
+        BlockTransferRequestConverter::encodeTransferResult(*memory_response, result);
         return true;
     }
 

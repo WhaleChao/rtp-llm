@@ -74,14 +74,14 @@ private:
                                                                        const std::function<bool(KVCacheManager&)>& initializer);
     absl::Status                      initSystemPrompt();
     size_t                            reserveStepForStream(bool is_prefill_only) const;
+    std::shared_ptr<GenerateInput> makeFakeInput(size_t seq_len);
+    size_t                         getWarmUpInputLength() const;
     static size_t warmUpReservedBlockCount(size_t seq_len, size_t reserve_tokens, size_t tokens_per_block);
     static bool   shouldEarlyReturnEmptyBatch(bool streams_empty, int64_t tp_size, bool enable_ffn_disaggregate);
     static bool   shouldAddMtpFakePrefill(bool has_prefill, bool use_batch_decode_scheduler, int64_t dp_size);
+    void                           mayAddFakeStream(std::list<GenerateStreamPtr>& streams);
 
     bool                           isFirstStageRoot() const;
-    std::shared_ptr<GenerateInput> makeFakeInput(size_t seq_len);
-    size_t                         getWarmUpInputLength() const;
-    void                           mayAddFakeStream(std::list<GenerateStreamPtr>& streams);
 
     void initExecutor(const EngineInitParams& params);
 

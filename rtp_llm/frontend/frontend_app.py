@@ -425,11 +425,17 @@ class FrontendApp(object):
         # Compute all DP addresses for broadcast operations (e.g. update_scheduler_info)
         dp_addresses = get_dp_rpc_addresses(py_env_configs)
         client_config = self.py_env_configs.grpc_config.get_client_config()
+        # Resolve stage roots only on PP EPLB updates, after backend bootstrap.
+        eplb_address_resolver = None
+        if py_env_configs.parallelism_config.pp_size > 1:
+            eplb_address_resolver = lambda: get_eplb_stage_root_addresses(
+                py_env_configs
+            )
         self.grpc_client = GrpcClientWrapper(
             self.server_config.rpc_server_port,
             dp_addresses=dp_addresses,
             client_config=client_config,
-            eplb_address_resolver=lambda: get_eplb_stage_root_addresses(py_env_configs),
+            eplb_address_resolver=eplb_address_resolver,
         )
 
         logging.info(

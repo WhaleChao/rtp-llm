@@ -1859,19 +1859,33 @@ TEST_F(KVCacheManagerTest, ExecuteFunctionSkipsAbsentGroupSetOnlyWithPP) {
         auto*             mem_request = request.mutable_mem_request();
         mem_request->set_copy_direction(MemoryOperationRequestPB::H2D);
         mem_request->set_timeout_ms(1000);
-        auto* item = mem_request->add_copy_items();
-        item->add_group_tags("absent_group");
-        item->set_mem_block(1);
-        auto* block = item->add_group_blocks();
-        block->set_tag("absent_group");
-        block->set_block_id(1);
+        for (const int block_id : {1, 2}) {
+            auto* item = mem_request->add_copy_items();
+            item->add_group_tags("absent_group");
+            item->set_mem_block(block_id);
+            auto* block = item->add_group_blocks();
+            block->set_tag("absent_group");
+            block->set_block_id(block_id);
+        }
         FunctionResponsePB response;
 
         EXPECT_TRUE(manager->executeFunction(request, response));
         ASSERT_TRUE(response.has_mem_response());
         EXPECT_EQ(response.mem_response().code(),
                   pp_size > 1 ? MemoryOperationResponsePB::OK : MemoryOperationResponsePB::INVALID_REQUEST);
+        ASSERT_EQ(response.mem_response().block_errors_size(), mem_request->copy_items_size());
+        const auto result = BlockTransferRequestConverter::decodeTransferResult(response.mem_response(),
+                                                                                mem_request->copy_items_size());
+        EXPECT_EQ(result.ok(), pp_size > 1);
+        EXPECT_EQ(result.status.code(), pp_size > 1 ? ErrorCode::NONE_ERROR : ErrorCode::INVALID_PARAMS);
+        const auto expected_error = pp_size > 1 ? CacheCopyError::NONE : CacheCopyError::INVALID_REQUEST;
+        EXPECT_EQ(result.copy_error, expected_error);
+        EXPECT_EQ(result.block_errors, std::vector<CacheCopyError>(mem_request->copy_items_size(), expected_error));
+        if (pp_size > 1) {
+            EXPECT_TRUE(result.status.ToString().empty());
+        }
         EXPECT_EQ(engine->submitted_batch_count, 0u);
+        EXPECT_EQ(engine->submitted_descriptor_count, 0u);
     }
 }
 

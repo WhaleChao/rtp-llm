@@ -38,7 +38,15 @@ def start_frontend_server(
     global_controller: ConcurrencyController,
     py_env_configs: PyEnvConfigs,
 ):
-    local_rank = world_rank % py_env_configs.parallelism_config.local_world_size
+    pc = py_env_configs.parallelism_config
+    # Topology uses the global rank; listening ports use the derived local rank.
+    set_parallelism_config(
+        pc,
+        world_rank,
+        py_env_configs.ffn_disaggregate_config,
+        py_env_configs.prefill_cp_config,
+    )
+    local_rank = pc.local_rank
     _install_hot_hook_runtime(f"frontend_rank_{local_rank}_server_{server_id}")
     logging.info(
         f"[PROCESS_START]Start frontend server process rank_{local_rank}_server_{server_id}"
@@ -50,19 +58,8 @@ def start_frontend_server(
         logging.info(f"import FrontendApp took {time.time() - start_time:.2f}s")
 
     py_env_configs.server_config.frontend_server_id = server_id
-    # Topology uses the global rank; listening ports use the derived local rank.
-    set_parallelism_config(
-        py_env_configs.parallelism_config,
-        world_rank,
-        py_env_configs.ffn_disaggregate_config,
-        py_env_configs.prefill_cp_config,
-    )
-    py_env_configs.server_config.set_local_rank(
-        py_env_configs.parallelism_config.local_rank
-    )
-    py_env_configs.distribute_config.set_local_rank(
-        py_env_configs.parallelism_config.local_rank
-    )
+    py_env_configs.server_config.set_local_rank(local_rank)
+    py_env_configs.distribute_config.set_local_rank(local_rank)
     setproctitle(f"rtp_llm_frontend_server_rank_{local_rank}_server_{server_id}")
 
     try:

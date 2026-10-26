@@ -39,7 +39,15 @@ def start_dash_sc_server(
     pipe_writer=None,
     bind_barrier=None,
 ):
-    local_rank = world_rank % py_env_configs.parallelism_config.local_world_size
+    pc = py_env_configs.parallelism_config
+    # Topology uses the global rank; listening ports use the derived local rank.
+    set_parallelism_config(
+        pc,
+        world_rank,
+        py_env_configs.ffn_disaggregate_config,
+        py_env_configs.prefill_cp_config,
+    )
+    local_rank = pc.local_rank
     _install_hot_hook_runtime(f"dash_sc_rank_{local_rank}_server_{server_id}")
     logging.info(
         f"[PROCESS_START]Start dash_sc server process rank_{local_rank}_server_{server_id}"
@@ -51,19 +59,8 @@ def start_dash_sc_server(
         logging.info(f"import DashScApp took {time.time() - start_time:.2f}s")
 
     py_env_configs.server_config.frontend_server_id = server_id
-    # Topology uses the global rank; listening ports use the derived local rank.
-    set_parallelism_config(
-        py_env_configs.parallelism_config,
-        world_rank,
-        py_env_configs.ffn_disaggregate_config,
-        py_env_configs.prefill_cp_config,
-    )
-    py_env_configs.server_config.set_local_rank(
-        py_env_configs.parallelism_config.local_rank
-    )
-    py_env_configs.distribute_config.set_local_rank(
-        py_env_configs.parallelism_config.local_rank
-    )
+    py_env_configs.server_config.set_local_rank(local_rank)
+    py_env_configs.distribute_config.set_local_rank(local_rank)
     setproctitle(f"rtp_llm_dash_sc_server_rank_{local_rank}_server_{server_id}")
 
     try:

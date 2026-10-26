@@ -194,11 +194,9 @@ class RankLayout:
 
     def ep_rank_of(self, world_rank: int, ep_size: int) -> int:
         """Expert-shard number within a stage, for a world rank in this layout.
-        ep_size must divide the per-stage rank count; ep_size <= 1 means no EP."""
+        ep_size must be positive and divide the per-stage rank count."""
         coord = self.coord_of(world_rank)
         ep_size = int(ep_size)
-        if ep_size <= 1:
-            return 0
         stride = self.lane_stride()
         if stride % ep_size != 0:
             raise ValueError(

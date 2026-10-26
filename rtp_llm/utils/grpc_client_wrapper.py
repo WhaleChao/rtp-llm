@@ -263,23 +263,26 @@ class GrpcClientWrapper:
         }
 
     async def update_eplb_config(self, req: Any) -> Dict[str, Any]:
-        """Update each stage root; the backend synchronizes within its stage."""
+        """Update the local backend, or fan out to PP stage roots when configured."""
         try:
             if isinstance(req, str):
                 req = json.loads(req)
-            epld_req = pb2.UpdateEplbConfigRequestPB(
+            eplb_req = pb2.UpdateEplbConfigRequestPB(
                 mode=req.get("mode", "NONE"),
                 update_time=int(time.time()),
             )
-            addresses = (
-                await asyncio.to_thread(self._eplb_address_resolver)
-                if self._eplb_address_resolver is not None
-                else [self.address]
-            )
+            if self._eplb_address_resolver is None:
+                await self._ensure_connection()
+                await self.stub.UpdateEplbConfig(eplb_req)
+                return {"status": "ok"}
+
+            # All stages receive the same control update. Each backend handles
+            # its own MoE layers; a stage without an expert balancer is a no-op.
+            addresses = await asyncio.to_thread(self._eplb_address_resolver)
 
             async def send_to_address(address: str):
                 await self._ensure_dp_connection(address)
-                await self._dp_stubs[address].UpdateEplbConfig(epld_req, timeout=3)
+                await self._dp_stubs[address].UpdateEplbConfig(eplb_req, timeout=3)
 
             results = await asyncio.gather(
                 *(send_to_address(address) for address in addresses),

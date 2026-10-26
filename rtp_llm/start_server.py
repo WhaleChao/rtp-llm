@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import traceback
+from typing import Iterator
 
 import requests
 import torch
@@ -20,6 +21,7 @@ from rtp_llm.config.server_config_setup import (
     load_gpu_nic_affinity,
     setup_and_configure_server,
 )
+from rtp_llm.distribute.distributed_server import get_local_world_info
 from rtp_llm.models_py.distributed.rank_layout import RankLayout
 from rtp_llm.ops import RoleType, SpeculativeType, VitSeparation
 from rtp_llm.server.server_args.server_args import setup_args
@@ -193,32 +195,27 @@ def start_backend_server_impl(
     return backend_process
 
 
-def _iter_serving_ranks(py_env_configs: PyEnvConfigs):
-    """Yield (rank, local_world_size) for each rank that should host frontend/dash_sc.
+def _iter_serving_world_ranks(py_env_configs: PyEnvConfigs) -> Iterator[int]:
+    """Yield global ranks of local workers that should host frontend/dash_sc.
 
-    Matches the historical frontend filter: rank 0 on every node (for heartbeat) plus
-    any tp_rank==0 rank.
+    To reduce the number of frontend servers, select only workers with TP rank 0,
+    except that local rank 0 on every node must also start for Kubernetes heartbeat
+    checks. DashSc uses the same serving ranks as the HTTP frontend.
     """
     pc = py_env_configs.parallelism_config
-    local_world_size = pc.world_size
-    if "LOCAL_WORLD_SIZE" in os.environ:
-        logging.info(
-            f"multi rank starts with local world size specified in env: {os.environ['LOCAL_WORLD_SIZE']}"
-        )
-        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
-    else:
-        logging.info(
-            f"multi rank starts with default local world size: {local_world_size}, world size = {pc.world_size}"
-        )
-
-    # Keep DashSc serving ranks aligned with frontend serving ranks.
+    local_world_info = get_local_world_info(
+        py_env_configs.server_config,
+        py_env_configs.distribute_config,
+        pc,
+    )
     layout = RankLayout.from_parallelism_config(pc)
-    for rank in range(local_world_size):
-        if rank == 0 or layout.coord_of(pc.world_rank + rank).tp == 0:
-            yield rank
+    for member in local_world_info.members:
+        coord = layout.coord_of(member.world_rank)
+        if member.local_rank == 0 or coord.tp == 0:
+            yield member.world_rank
         else:
             logging.info(
-                f"rank {pc.world_rank + rank} skipping frontend/dash_sc startup"
+                f"world rank {member.world_rank} skipping frontend/dash_sc startup"
             )
 
 
@@ -231,35 +228,37 @@ def start_dash_sc_server_impl(
     from rtp_llm.start_dash_sc_server import start_dash_sc_server
 
     frontend_server_count = py_env_configs.server_config.frontend_server_count
+    pc = py_env_configs.parallelism_config
     dash_sc_processes = []
     dash_sc_pipe_readers = []
 
     worker_specs = [
-        (rank, server_id)
-        for rank in _iter_serving_ranks(py_env_configs)
+        (world_rank, server_id)
+        for world_rank in _iter_serving_world_ranks(py_env_configs)
         for server_id in range(frontend_server_count)
     ]
     if not worker_specs:
         return dash_sc_processes
 
     bind_barrier = multiprocessing.Barrier(len(worker_specs))
-    for rank, server_id in worker_specs:
+    for world_rank, server_id in worker_specs:
+        local_rank = world_rank % pc.local_world_size
         pipe_reader, pipe_writer = multiprocessing.Pipe(duplex=False)
         logging.info(
             f"[PROCESS_SPAWN]Start dash_sc server process "
-            f"rank_{rank}_server_{server_id} outer"
+            f"rank_{local_rank}_server_{server_id} outer"
         )
         process = multiprocessing.Process(
             target=start_dash_sc_server,
             args=(
-                py_env_configs.parallelism_config.world_rank + rank,
+                world_rank,
                 server_id,
                 global_controller,
                 py_env_configs,
                 pipe_writer,
                 bind_barrier,
             ),
-            name=f"dash_sc_server_{rank}_{server_id}",
+            name=f"dash_sc_server_{local_rank}_{server_id}",
         )
         dash_sc_processes.append(process)
         process.start()
@@ -488,40 +487,25 @@ def start_frontend_server_impl(
     frontend_processes = []
 
     pc = py_env_configs.parallelism_config
-    local_world_size = pc.world_size
-    if "LOCAL_WORLD_SIZE" in os.environ:
-        logging.info(
-            f"multi rank starts with local world size specified in env: {os.environ['LOCAL_WORLD_SIZE']}"
-        )
-        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
-    else:
-        logging.info(
-            f"multi rank starts with default local world size: {local_world_size}, world size = {pc.world_size}"
-        )
-
-    # To reduce the number of frontend servers, we only start those with tp_rank=0;
-    # however, since k8s needs to check machine heartbeat, rank 0 on each machine also needs to be started.
-    layout = RankLayout.from_parallelism_config(pc)
-    for rank in range(local_world_size):
+    # The shared iterator applies TP-rank filtering and the per-node heartbeat exception.
+    for world_rank in _iter_serving_world_ranks(py_env_configs):
+        local_rank = world_rank % pc.local_world_size
         for i in range(frontend_server_count):
-            if rank == 0 or layout.coord_of(pc.world_rank + rank).tp == 0:
-                logging.info(
-                    f"[PROCESS_SPAWN]Start frontend server process rank_{rank}_server_{i} outer"
-                )
-                process = multiprocessing.Process(
-                    target=start_frontend_server,
-                    args=(
-                        pc.world_rank + rank,
-                        i,
-                        global_controller,
-                        py_env_configs,
-                    ),
-                    name=f"frontend_server_{i}",
-                )
-                frontend_processes.append(process)
-                process.start()
-            else:
-                logging.info(f"rank {pc.world_rank + rank} skipping frontend startup")
+            logging.info(
+                f"[PROCESS_SPAWN]Start frontend server process rank_{local_rank}_server_{i} outer"
+            )
+            process = multiprocessing.Process(
+                target=start_frontend_server,
+                args=(
+                    world_rank,
+                    i,
+                    global_controller,
+                    py_env_configs,
+                ),
+                name=f"frontend_server_{i}",
+            )
+            frontend_processes.append(process)
+            process.start()
 
     if process_manager and frontend_processes:
 
