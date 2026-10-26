@@ -16,7 +16,6 @@
 #include "rtp_llm/cpp/engine_base/schedulers/BatchDecodeScheduler.h"
 #include "rtp_llm/cpp/engine_base/schedulers/SchedulerUtils.h"
 #include "rtp_llm/cpp/engine_base/schedulers/PDFusionRatioScheduler.h"
-#include "rtp_llm/cpp/cache/CPSlotMapper.h"
 #include "rtp_llm/cpp/cache/test/CacheConfigTestUtils.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/load/LoadAsyncContext.h"
 #include "rtp_llm/cpp/cache/test/mock/MockCoordinatorCacheManager.h"
@@ -6068,10 +6067,6 @@ TEST_F(FIFOSchedulerTest, testChunkedPrefillChecksCyclicGroupBlocks) {
         env.resource_context.reuse_cache                   = test_case.global_reuse;
         env.resource_context.ignore_request_cache_switches = test_case.ignore_request_switches;
         ASSERT_TRUE(env.init());
-        if (test_case.cp_size > 0) {
-            env.cache_manager->cp_slot_mapper_ =
-                std::make_shared<CPSlotMapper>(0, test_case.cp_size, test_case.block_size);
-        }
         auto stream = env.makeStream(std::vector<int>(1200, 1));
         stream->generateConfig()->reuse_cache = test_case.request_reuse;
         bool accepted;
@@ -6106,6 +6101,7 @@ TEST_F(FIFOSchedulerTest, testChunkedPrefillChecksCyclicGroupBlocks) {
             cache_config.setTopology(std::move(groups), cache_config.topology().layers());
         }
         cache_config.linear_step = test_case.step;
+        cache_config.storage_cp_size = std::max(1, test_case.cp_size);
         ChunkSchedulerTestConfig config;
         config.seq_size_per_block = test_case.block_size;
         config.prefill_chunk_size = test_case.chunk_size;
