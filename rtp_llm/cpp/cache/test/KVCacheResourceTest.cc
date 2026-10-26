@@ -156,6 +156,87 @@ TEST(BlockIdsTest, NonFull_MirrorsKernelBlocks) {
     ASSERT_EQ(ids.kernelBlocks(), (BlockIndicesType{3, 9, 1}));
 }
 
+TEST(BlockIdsTest, SharedKernelBlocksReuseStateWithoutChangingOwningRows) {
+    BlockIds state;
+    state.assign({NULL_BLOCK_IDX, NULL_BLOCK_IDX, NULL_BLOCK_IDX, 7, 8});
+    const auto       owning = state.blocks();
+    BlockIndicesType execution(state.kernelBlocks().size(), 42);
+    // Only each chunk's last logical block writes; the speculative reserve stays distinct.
+    state.copySharedKernelBlocks(3, 0, execution.data());
+    EXPECT_EQ(execution, (BlockIndicesType{7, NULL_BLOCK_IDX, NULL_BLOCK_IDX, NULL_BLOCK_IDX, 8}));
+    state.copySharedKernelBlocks(3, 1, execution.data());
+    EXPECT_EQ(execution, (BlockIndicesType{NULL_BLOCK_IDX, 7, NULL_BLOCK_IDX, NULL_BLOCK_IDX, 8}));
+    state.copySharedKernelBlocks(3, 3, execution.data());
+    EXPECT_EQ(execution, (BlockIndicesType{NULL_BLOCK_IDX, NULL_BLOCK_IDX, NULL_BLOCK_IDX, 7, 8}));
+    EXPECT_EQ(state.blocks(), owning);
+    EXPECT_EQ(state.kernelBlocks(), owning);
+}
+
+TEST(BlockIdsTest, CyclicKernelBlocksKeepHistoryDistinctAndPreserveCanonicalTail) {
+    BlockIds state;
+    state.assign({NULL_BLOCK_IDX, NULL_BLOCK_IDX, NULL_BLOCK_IDX, 7, 8, 9, 10});
+    const auto&     kernel = state.kernelBlocks();
+    BlockIndicesType execution(kernel.size());
+    state.copyCyclicKernelBlocks(5, 3, execution.data());
+    EXPECT_EQ(execution, (BlockIndicesType{7, 8, 9, 7, 8, 9, 10}));
+    EXPECT_EQ(kernel, execution);  // The existing kernel row holds the cached execution mapping.
+    EXPECT_EQ(state.blocks(), (BlockIndicesType{-1, -1, -1, 7, 8, 9, 10}));
+    EXPECT_EQ(state.kernelBlocks(), state.blocks());
+    std::fill(execution.begin(), execution.end(), 42);
+    state.copyCyclicKernelBlocks(5, 3, execution.data());
+    EXPECT_EQ(execution, (BlockIndicesType{7, 8, 9, 7, 8, 9, 10}));
+    state.copyCyclicKernelBlocks(5, 2, execution.data());
+    EXPECT_EQ(execution, (BlockIndicesType{8, 9, 8, 9, 8, 9, 10}));
+    state.copyCyclicKernelBlocks(4, 2, execution.data());
+    EXPECT_EQ(execution, (BlockIndicesType{8, 7, 8, 7, 8, 9, 10}));
+    state.copyCyclicKernelBlocks(5, 3, execution.data());
+    state.setAt(4, 11);
+    EXPECT_EQ(kernel, state.blocks());  // A mutation restores the whole ordinary row.
+    state.copyCyclicKernelBlocks(5, 3, execution.data());
+    EXPECT_EQ(execution, (BlockIndicesType{7, 11, 9, 7, 11, 9, 10}));
+    EXPECT_EQ(state.popBack(), 10);
+    std::fill(execution.begin(), execution.end(), 42);
+    state.copyCyclicKernelBlocks(5, 3, execution.data());
+    EXPECT_EQ(execution, (BlockIndicesType{7, 11, 9, 7, 11, 9, 42}));
+    state.add({12});
+    state.copyCyclicKernelBlocks(5, 3, execution.data());
+    state.resize(6);
+    std::fill(execution.begin(), execution.end(), 42);
+    state.copyCyclicKernelBlocks(5, 3, execution.data());
+    EXPECT_EQ(execution, (BlockIndicesType{7, 11, 9, 7, 11, 9, 42}));
+    state.assign({NULL_BLOCK_IDX, NULL_BLOCK_IDX, NULL_BLOCK_IDX, 7, 8, 9});
+    execution.resize(state.kernelBlocks().size());
+    state.copyCyclicKernelBlocks(4, 2, execution.data());
+    EXPECT_EQ(execution, (BlockIndicesType{8, 7, 8, 7, 8, 9}));
+}
+
+TEST(BlockIdsTest, ChunkCacheCapacityPreservesCheckpointsAndBoundsSparseBanks) {
+    auto linear = makeResourceGroup("linear", CacheGroupType::LINEAR);
+    EXPECT_EQ(linear.chunkCacheBlockCount(80, 8, false), 2u);
+    EXPECT_EQ(linear.chunkCacheBlockCount(80, 16, false), 3u);
+    EXPECT_EQ(linear.chunkCacheBlockCount(80, 8, false, 1), 3u);
+    EXPECT_EQ(linear.chunkCacheBlockCount(80, 8, true), 0u);
+    EXPECT_EQ(linear.chunkCacheBlockCount(5, 16, false), 1u);
+    linear.policy.active_tail_blocks = 4;
+    EXPECT_EQ(linear.chunkCacheBlockCount(80, 8, false), 4u);
+    auto swa                       = makeResourceGroup("swa", CacheGroupType::SWA);
+    EXPECT_EQ(swa.chunkCacheBlockCount(80, 8, true), 3u);  // No configured window: retain conservative history.
+    swa.policy.sliding_window_size = 8;
+    EXPECT_EQ(swa.chunkCacheBlockCount(80, 8, true), 2u);
+    swa.policy.sliding_window_size = 1;
+    EXPECT_EQ(swa.chunkCacheBlockCount(80, 8, true), 2u);  // Final tail still owns two blocks.
+    swa.policy.sliding_window_size = 24;
+    EXPECT_EQ(swa.chunkCacheBlockCount(80, 8, true), 4u);
+    EXPECT_EQ(swa.chunkCacheBlockCount(80, 0, true), 0u);
+    auto cp_spec                       = swa.spec->clone();
+    cp_spec->seq_size_per_block        = 16;
+    cp_spec->kernel_seq_size_per_block = 16;
+    swa.spec                           = std::move(cp_spec);
+    EXPECT_EQ(swa.chunkCacheBlockCount(80, 16, true), 3u);
+    auto full = makeResourceGroup("full", CacheGroupType::FULL);
+    EXPECT_EQ(full.chunkCacheBlockCount(80, 8, false), 0u);
+}
+
 TEST(KVCacheResourceTest, SwapBlocksUsesTagAcrossDifferentGroupOrders) {
     for (const bool reversed : {false, true}) {
         std::vector<GroupBase> groups{makeResourceGroup("full", CacheGroupType::FULL),
@@ -231,6 +312,42 @@ TEST(BatchKVCacheResourceTest, CheckMatchesTagsAcrossMixedResourceOrders) {
     EXPECT_ANY_THROW(batches.check());
     batches.cacheResource(1).initGroups(makeTestCacheTopology(1, 1, {{0}}));
     EXPECT_ANY_THROW(batches.check());
+}
+
+TEST(KVCacheResourceTest, CompactBeamTablesPreserveLayerViewsAndKernelMapping) {
+    auto topology = CacheTopology::create(
+        {makeResourceGroup("linear", CacheGroupType::LINEAR), makeResourceGroup("full", CacheGroupType::FULL)},
+        {{0, {"full"}}, {1, {"full", "linear"}}, {2, {"linear"}}});
+    KVCacheResource resource;
+    resource.initGroups(topology, false);
+    topology.reset();  // The compact resource owns the immutable membership.
+    resource.mutableBlockIds("full").assign({2, 3});
+    resource.mutableBlockIds("linear").assign({4});
+    EXPECT_ANY_THROW(resource.blocksForLayer(0, "linear"));
+    EXPECT_EQ(resource.blocksForLayer(1, "full"), (BlockIndicesType{2, 3}));
+    EXPECT_EQ(resource.kernelBlocksForLayer(1, "full"), (BlockIndicesType{8, 9, 10, 11, 12, 13, 14, 15}));
+    EXPECT_EQ(resource.kernelBlocksForLayer(1, "linear"), (BlockIndicesType{4}));
+    EXPECT_EQ(resource.groupTags(), (std::vector<std::string>{"linear", "full"}));
+    EXPECT_ANY_THROW(resource.layerBlocks());
+    auto holder = resource.groupBlockIds("full");
+    auto moved  = std::move(resource);
+    moved.mutableBlockIdsForLayer(1, "full").setAt(1, 5);
+    EXPECT_EQ(holder->blocks(), (BlockIndicesType{2, 5}));
+    EXPECT_EQ(moved.groupTagsForLayer(1), (std::vector<std::string>{"full", "linear"}));
+    EXPECT_EQ(moved.layerNum(), 3);
+    EXPECT_ANY_THROW(moved.groupTagsForLayer(-1));
+    EXPECT_ANY_THROW(moved.groupTagsForLayer(3));
+    for (const bool materialize : {false, true}) {
+        moved.initGroups(
+            CacheTopology::create({makeResourceGroup("full", CacheGroupType::FULL)}, {{0, {"full"}}, {1, {"full"}}}),
+            materialize);
+        EXPECT_EQ(moved.layerNum(), 2);
+        auto layers = moved.layerBlocks();
+        ASSERT_EQ(layers.size(), 2u);
+        EXPECT_EQ(layers[0], moved.groupBlockIds("full"));
+        EXPECT_EQ(layers[0], layers[1]);
+        EXPECT_ANY_THROW(moved.blocks("linear"));
+    }
 }
 
 TEST(BlockIdsTest, Full_ExpandsKernelBlocks) {

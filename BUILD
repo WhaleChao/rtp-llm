@@ -133,6 +133,14 @@ config_setting(
 )
 
 config_setting(
+    name = "using_ppu_cuda",
+    define_values = {
+        "use_ppu": "true",
+        "using_cuda": "true",
+    },
+)
+
+config_setting(
     name = "using_remote_kv_cache",
     define_values = {"use_remote_kv_cache": "true"},
 )
@@ -140,7 +148,12 @@ config_setting(
 cc_binary(
     name = "th_transformer_config",
     copts = copts(),
+    # --as-needed first: the config .so references zero CUDA/nccl/cudnn
+    # symbols (torch C++ ABI only), but the transitive torch_deps() link line
+    # otherwise bakes them in as dead DT_NEEDED entries — which would force
+    # even the CPU-frontend wheel to ship the whole CUDA library tree.
     linkopts = [
+        "-Wl,--as-needed",
         "-Wl,-rpath='$$ORIGIN'",
     ],
     linkshared = 1,
@@ -234,6 +247,22 @@ py_runtime(
     interpreter_path = "/opt/conda310/bin/python",
     python_version = "PY3",
     stub_shebang = "#!/opt/conda310/bin/python",
+    visibility = ["//visibility:public"],
+)
+
+py_runtime(
+    name = "python312",
+    interpreter_path = "/usr/local/bin/python3",
+    python_version = "PY3",
+    stub_shebang = "#!/usr/local/bin/python3",
+    visibility = ["//visibility:public"],
+)
+
+py_runtime(
+    name = "python312_ppu",
+    interpreter_path = "/opt/conda312/bin/python",
+    python_version = "PY3",
+    stub_shebang = "#!/opt/conda312/bin/python",
     visibility = ["//visibility:public"],
 )
 

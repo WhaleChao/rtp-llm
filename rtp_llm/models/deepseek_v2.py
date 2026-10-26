@@ -607,6 +607,16 @@ class DeepSeekV2(BaseModel):
         if merged_lora:
             return ()
 
+        if (
+            getattr(target_config, "enable_output_vocab_pruning", False)
+            or getattr(draft_model_config, "enable_output_vocab_pruning", False)
+            or getattr(draft_model_config, "normalize_lm_head_weight", False)
+            or getattr(draft_model_config, "logit_scale", 1.0) != 1.0
+            or list(getattr(target_config, "output_vocab_ids", ()))
+            != list(getattr(draft_model_config, "output_vocab_ids", ()))
+        ):
+            return ()
+
         target_path = getattr(target_config, "ckpt_path", None)
         draft_path = getattr(draft_model_config, "ckpt_path", None)
         if (
@@ -621,6 +631,7 @@ class DeepSeekV2(BaseModel):
             ("vocab_size", None),
             ("hidden_size", None),
             ("data_type", None),
+            ("tie_word_embeddings", False),
             ("enable_fp32_lm_head", True),
             ("normalize_lm_head_weight", False),
             ("logit_scale", 1.0),
@@ -631,7 +642,6 @@ class DeepSeekV2(BaseModel):
             ):
                 return ()
         return (W.embedding, W.lm_head)
-
 
     @classmethod
     def _create_config(cls, ckpt_path: str):

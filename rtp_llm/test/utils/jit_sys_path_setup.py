@@ -11,14 +11,16 @@ a specific version of flashinfer different from the system-installed one.
 import importlib.metadata
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 from rtp_llm.utils import jit_cache_env as cache_env
 
@@ -26,36 +28,40 @@ from rtp_llm.utils import jit_cache_env as cache_env
 def get_package_info(package_name):
     """Get package version and installation path"""
     try:
-        # Try to import the package first to get its location
         import importlib
 
         runfiles_dir = os.environ.get("RUNFILES_DIR") or os.environ.get("TEST_SRCDIR")
         meta_package_name = package_name
         if package_name == "tvm_ffi":
             meta_package_name = "apache-tvm-ffi"
+        elif package_name == "flashinfer":
+            # the wheel that provides the flashinfer module is flashinfer-python
+            meta_package_name = "flashinfer-python"
 
-        if runfiles_dir and os.path.exists(runfiles_dir):
-            if runfiles_dir not in sys.path:
-                sys.path.insert(0, runfiles_dir)
+        saved_path = list(sys.path)
+        try:
+            if runfiles_dir and os.path.exists(runfiles_dir):
+                if runfiles_dir not in sys.path:
+                    sys.path.insert(0, runfiles_dir)
 
-            for item in os.listdir(runfiles_dir):
-                if item.startswith("pip_"):
-                    pip_path = os.path.join(runfiles_dir, item, "site-packages")
-                    if os.path.exists(pip_path) and pip_path not in sys.path:
-                        sys.path.insert(0, pip_path)
+                for item in os.listdir(runfiles_dir):
+                    if item.startswith("pip_"):
+                        pip_path = os.path.join(runfiles_dir, item, "site-packages")
+                        if os.path.exists(pip_path) and pip_path not in sys.path:
+                            sys.path.insert(0, pip_path)
 
-        module = importlib.import_module(package_name)
-        if hasattr(module, "__file__") and module.__file__:
-            package_path = Path(module.__file__).parent
-            # Get version from metadata
-            try:
-                dist = importlib.metadata.distribution(meta_package_name)
-                version = dist.version
-                return version, str(package_path)
-            except:
-                # If no metadata, use __version__ attribute
-                if hasattr(module, "__version__"):
-                    return module.__version__, str(package_path)
+            # Probe via metadata only: importing the module here would pin the
+            # runfiles copy in sys.modules for the rest of the process, and any
+            # JIT rules that process generates would then anchor include paths
+            # to the per-action runfiles tree, which dangles for every other
+            # consumer of the shared JIT workspace.
+            dist = importlib.metadata.distribution(meta_package_name)
+            version = dist.version
+            package_path = dist.locate_file(package_name)
+        finally:
+            sys.path[:] = saved_path
+        if Path(str(package_path)).exists():
+            return version, str(package_path)
         return None, None
     except Exception as e:
         logging.info(f"[Package Copy] Failed to get info for {package_name}: {e}")
@@ -83,10 +89,17 @@ def _build_variant(source_path):
 
 
 def _cache_key(package_name, version, source_path):
+    # The interpreter ABI is part of the build identity too: a host can serve
+    # jobs running different Python versions from the same pip variant (the
+    # 2026-10-23 ppu312 pool swap ran cp312 jobs alongside the cp310 bazel
+    # lane), and a cached copy materialized under one interpreter breaks the
+    # other (cp312-abi3 tvm_ffi core.abi3.so references Py_Version, undefined
+    # on 3.10). Key on it so each interpreter stages its own copy.
+    py_tag = "cp%d%d" % sys.version_info[:2]
     variant = _build_variant(source_path)
     if variant is None:
-        return "%s_python-%s" % (package_name, version)
-    return "%s_python-%s__%s" % (package_name, version, variant)
+        return "%s_python-%s-%s" % (package_name, version, py_tag)
+    return "%s_python-%s-%s__%s" % (package_name, version, py_tag, variant)
 
 
 def copy_package_with_lock(package_name, cache_dir):
@@ -264,7 +277,91 @@ def bootstrap_remote_jit_dir():
         logging.warning(f"[JIT] REMOTE_JIT_DIR refused ({e}); cold start later")
 
 
+def _flashinfer_op_is_stale(op_dir: Path) -> bool:
+    rules_path = op_dir / "build.ninja"
+    try:
+        rules = rules_path.read_text(errors="ignore")
+    except OSError:
+        return False
+    # FlashInfer embeds the absolute include paths of the package instance that
+    # generated the rules (both -I and -isystem forms). A bazel action's runfiles
+    # tree only lives for that action, so rules anchored there dangle for every
+    # later consumer of the shared workspace -- whether or not the tree still
+    # exists at eviction time -- and only rules anchored to stable locations
+    # (package-copy cache, toolkit dirs) are safe to keep.
+    include_paths = re.findall(r"(?:-I|-isystem\s+)(/\S+)", rules)
+    if any(".runfiles" in path for path in include_paths):
+        return True
+    if any(not Path(path).exists() for path in include_paths):
+        return True
+    src_link = op_dir / "src"
+    return src_link.is_symlink() and not src_link.exists()
+
+
+def _evict_dangling_flashinfer_ops(workspace: Path) -> None:
+    """Drop cached FlashInfer ops whose build rules anchor to include paths that
+    are not stable for later consumers of the shared workspace.
+
+    FlashInfer's generated FMHA ninja rules embed the absolute include paths of the
+    flashinfer package instance that generated them. A bazel test action's runfiles
+    sandbox is per-action, so rules generated from a runfiles import dangle for every
+    later action that reuses the shared workspace and fail with missing-header
+    errors -- including when the generating action is still alive at eviction time,
+    because its sandbox disappears when the action completes. Evicting the affected
+    ops makes FlashInfer regenerate them against the current stable package copy.
+
+    FlashInfer serializes each op's build and load with a FileLock at
+    ``cached_ops/tmp/<op_name>.lock``; eviction takes that same lock and re-judges
+    staleness only inside it, so it cannot delete an op directory that a concurrent
+    compile or load is using or has just refreshed.
+
+    The lock wait is deliberately near-non-blocking: a stale op left behind only
+    costs its consumer one rebuild, while blocking behind a long compile here
+    silently stalls test startup (observed as a 664s pre-test gap).
+    """
+    started = time.monotonic()
+    stale_candidates = []
+    for root, _dirs, files in os.walk(workspace, followlinks=False):
+        op_dir = Path(root)
+        # FlashInfer layout only: cached_ops/<op_name>/build.ninja (never trust an
+        # unrelated build.ninja deeper in the tree).
+        if op_dir.parent.name != "cached_ops" or "build.ninja" not in files:
+            continue
+        if _flashinfer_op_is_stale(op_dir):
+            stale_candidates.append(op_dir)
+    logging.info(
+        f"[Package Setup] FlashInfer eviction scan found "
+        f"{len(stale_candidates)} stale candidate(s) under {workspace}"
+    )
+    evicted = 0
+    skipped = 0
+    for op_dir in sorted(stale_candidates):
+        lock_dir = op_dir.parent / "tmp"
+        try:
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock = FileLock(str(lock_dir / f"{op_dir.name}.lock"), timeout=3)
+            with lock:
+                # Re-read the rules under the op's own lock: a compile that ran
+                # since the first pass may have replaced the stale rules already.
+                if _flashinfer_op_is_stale(op_dir):
+                    shutil.rmtree(op_dir, ignore_errors=True)
+                    evicted += 1
+                    logging.info(
+                        f"[Package Setup] Evicted stale FlashInfer cache op: {op_dir}"
+                    )
+        except Timeout:
+            # Somebody else owns the op (likely recompiling it); leave it alone.
+            skipped += 1
+            logging.info(f"[Package Setup] Skipped eviction of {op_dir}: lock busy")
+    logging.info(
+        f"[Package Setup] FlashInfer eviction done in "
+        f"{time.monotonic() - started:.1f}s: evicted={evicted} skipped={skipped} "
+        f"of {len(stale_candidates)} candidate(s)"
+    )
+
+
 def setup_jit_cache(cache_dir=None, packages=None):
+    logging.info("[Package Setup] setup_jit_cache starting")
     bootstrap_remote_jit_dir()
     cache_env.configure_writable_cache_env(
         "FLASHINFER_WORKSPACE_BASE",
@@ -272,6 +369,7 @@ def setup_jit_cache(cache_dir=None, packages=None):
         "flashinfer",
         cache_subpath=(".cache", "flashinfer"),
     )
+    _evict_dangling_flashinfer_ops(Path(os.environ["FLASHINFER_WORKSPACE_BASE"]))
     cache_env.configure_writable_cache_env(
         "TRITON_CACHE_DIR", Path.home() / ".triton" / "cache", "triton"
     )

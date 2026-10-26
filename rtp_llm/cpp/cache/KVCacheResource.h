@@ -43,7 +43,14 @@ public:
 
     const BlockIndicesType& blocks() const;
 
+    // Return the ordinary kernel mapping, restoring it if a cyclic mapping was cached.
     const BlockIndicesType& kernelBlocks() const;
+
+    // Borrow the prompt state at the chunk tail; keep speculative reserve blocks distinct.
+    void copySharedKernelBlocks(size_t prompt_tail, size_t chunk_tail, BlockIdxType* destination) const;
+
+    // Cache the cyclic execution mapping and copy it without changing ownership or reserve IDs.
+    void copyCyclicKernelBlocks(size_t prompt_tail, size_t bank_count, BlockIdxType* destination) const;
 
     size_t kernelBlocksPerKvBlock() const;
 
@@ -66,16 +73,18 @@ public:
 
 private:
     // Update the kernel slots that correspond to physical block position `pos`.
-    void updateKernelSlotAt(size_t pos, BlockIdxType val);
+    void updateKernelSlotAt(size_t pos, BlockIdxType val) const;
     // Update all kernel slots
-    void syncKernelBlocks();
+    void syncKernelBlocks() const;
 
     BlockIndicesType block_indices;
-    // Kernel-granularity block IDs, always maintained.
+    // Kernel-granularity block IDs, also used to cache the cyclic execution mapping.
     // Size is always block_indices.size() * kernel_blocks_per_kv_block_.
-    // When kernel_blocks_per_kv_block_ == 1, kernel_block_indices_ mirrors block_indices.
-    BlockIndicesType kernel_block_indices_;
-    size_t           kernel_blocks_per_kv_block_ = 1;
+    mutable BlockIndicesType kernel_block_indices_;
+    size_t                   kernel_blocks_per_kv_block_ = 1;
+    mutable size_t           cyclic_prompt_tail_ = 0;
+    // Zero means the kernel row contains the ordinary mapping.
+    mutable size_t           cyclic_bank_count_  = 0;
 };
 
 // Build the complete identity/row pair before publishing it through a const owner view.
@@ -99,7 +108,7 @@ using LayerAttnBlockIds = std::vector<std::vector<std::shared_ptr<BlockIds>>>;
 
 class KVCacheResource {
 public:
-    void initGroups(std::shared_ptr<const CacheTopology> topology);
+    void initGroups(std::shared_ptr<const CacheTopology> topology, bool materialize_layer_views = true);
     void resizeBlocks(int reserver_blocks, int value = 0);
 
     int                     blocksNum(std::string_view tag) const;
@@ -184,6 +193,8 @@ private:
     void checkLayerTag(int layer_id, std::string_view tag) const;
     bool hasOneGroupPerLayer() const;
 
+    // Beam forks share immutable layer membership; default resources keep owning views.
+    std::shared_ptr<const CacheTopology>  topology_;
     std::vector<std::vector<std::string>> layer_group_tags_;
     GroupBlockIds         group_block_ids;
     CacheKeysType         cache_keys;

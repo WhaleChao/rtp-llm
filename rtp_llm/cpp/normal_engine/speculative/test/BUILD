@@ -36,12 +36,12 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ] + torch_deps(),
     # CPU-only logic, but normal_engine links libtorch_cuda, so the loader needs a
-    # CUDA host. Any generic CUDA worker suffices (default gpu=gpu_cuda12) — no H20.
+    # CUDA host. Any generic CUDA worker suffices (pinned L20_CU13) — no H20.
     env = {
         "TEST_USING_DEVICE": "CUDA",
     },
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 cc_test(
@@ -68,8 +68,8 @@ cc_test(
     env = {
         "TEST_USING_DEVICE": "CUDA",
     },
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 cc_test(
@@ -83,6 +83,7 @@ cc_test(
         "//rtp_llm/cpp/cache",
         "//rtp_llm/cpp/cache/test:cache_config_test_utils",
         "//rtp_llm/cpp/config:config_modules",
+        "//rtp_llm/cpp/engine_base/schedulers",
         "//rtp_llm/cpp/models",
         "//rtp_llm/cpp/normal_engine",
         "//rtp_llm/cpp/normal_engine/test:mock_engine",
@@ -96,6 +97,6 @@ cc_test(
     env = {
         "TEST_USING_DEVICE": "CUDA",
     },
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
