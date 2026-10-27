@@ -1661,10 +1661,13 @@ TEST_F(BlockTreeCacheFactoryTest, IndependentPoolsWatermarkTracksEachGroupSet) {
         request_blocks.push_back(insertOneKeyThroughAllocator(config, allocator, key));
     }
     ASSERT_EQ(backing->freeBlocksNum(), 1u);
+    block_tree_cache_test::BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+    EXPECT_EQ(scripted_copy->submittedDescriptorCount(), 0u);
     for (const auto& blocks : request_blocks) {
         releaseInsertedRequestBlocks(allocator, blocks);
     }
 
+    block_tree_cache_test::BlockTreeCacheTestPeer::runMaintenanceForTest(*cache);
     block_tree_cache_test::BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
 
     // Each independent pool releases two cached blocks to reach its own low watermark.

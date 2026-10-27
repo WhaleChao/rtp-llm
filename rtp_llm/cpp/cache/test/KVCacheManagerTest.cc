@@ -1911,6 +1911,19 @@ protected:
         manager_->free(FreeInfo{req.resource, req.tokens});
     }
 
+    void expectDeviceOnly(const Request& req) {
+        auto                        cache = manager_->blockTreeCache();
+        std::lock_guard<std::mutex> lock(cache->mutex_);
+        const auto                  path = cache->tree()->findNode(req.keys);
+        ASSERT_EQ(path.size(), 2u);
+        for (const auto* node : path) {
+            const auto& resource = node->group_set_resources[0];
+            ASSERT_EQ(resource.transfer_state, GroupSetTransferState::IDLE);
+            ASSERT_TRUE(resource.hasTier(Tier::DEVICE));
+            ASSERT_FALSE(resource.hasTier(Tier::HOST));
+        }
+    }
+
     void hostPayload(const Request& req) {
         auto                        cache = manager_->blockTreeCache();
         std::lock_guard<std::mutex> lock(cache->mutex_);
@@ -1942,8 +1955,7 @@ protected:
     void demote() {
         auto cache = manager_->blockTreeCache();
         // Capacity is 16: a positive ratio below 1/16 targets zero used
-        // blocks. Pending loads are ineligible; completed live requests keep
-        // their device references even if the tree's copy is demoted again.
+        // blocks. Pending loads and blocks held by live requests are ineligible.
         BlockTreeCacheTestPeer::setTierWatermarkForTest(*cache, Tier::DEVICE, 0.01);
         BlockTreeCacheTestPeer::runMaintenanceForTest(*cache);
     }
@@ -2054,11 +2066,13 @@ protected:
             ASSERT_NO_FATAL_FAILURE(devicePayload(*req, /*write=*/false, 2));
         }
         if (concurrent) {
-            // Completion re-admits A/B to the eviction heap. The low watermark
-            // demotes their tree copies again, but the live requests above must
-            // still see the original GPU bytes through their request references.
-            ASSERT_NO_FATAL_FAILURE(hostPayload(a));
-            ASSERT_NO_FATAL_FAILURE(hostPayload(b));
+            // A fresh pass must preserve A/B while the load-back requests hold
+            // them. C/D have no request references and can finish demoting.
+            demote();
+            BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+            BlockTreeCacheTestPeer::setTierWatermarkForTest(*cache, Tier::DEVICE, 0.0);
+            ASSERT_NO_FATAL_FAILURE(expectDeviceOnly(a));
+            ASSERT_NO_FATAL_FAILURE(expectDeviceOnly(b));
             ASSERT_NO_FATAL_FAILURE(hostPayload(c));
             ASSERT_NO_FATAL_FAILURE(hostPayload(d));
         }
@@ -2074,10 +2088,17 @@ protected:
                 ADD_FAILURE() << "unexpected transfer direction";
             }
         }
-        EXPECT_EQ(d2h, concurrent ? 12u : 4u);  // Initial A/B, then C/D and re-demoted A/B.
+        EXPECT_EQ(d2h, concurrent ? 8u : 4u);  // Initial A/B, then C/D; held A/B are not demoted.
         EXPECT_EQ(h2d, 4u);
         manager_->free(FreeInfo{load_a.resource, load_a.tokens});
         manager_->free(FreeInfo{load_b.resource, load_b.tokens});
+        if (concurrent) {
+            demote();
+            BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+            BlockTreeCacheTestPeer::setTierWatermarkForTest(*cache, Tier::DEVICE, 0.0);
+            ASSERT_NO_FATAL_FAILURE(hostPayload(a));
+            ASSERT_NO_FATAL_FAILURE(hostPayload(b));
+        }
         BlockTreeCacheTestPeer::reclaimBlocksForTest(*cache, 100, Tier::DEVICE);
         BlockTreeCacheTestPeer::reclaimBlocksForTest(*cache, 100, Tier::HOST);
         EXPECT_EQ(manager_->freeBlocksNum(), 16u);
