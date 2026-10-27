@@ -304,7 +304,9 @@ def warmup_kv_overlap(group: Any) -> torch.cuda.Stream:
         _get_comm(process_group, device)
     key = _comm_key(process_group, device)
     if key not in _OVERLAP_STREAMS:
-        _OVERLAP_STREAMS[key] = torch.cuda.Stream(device=device)
+        # Let short cache pack/write kernels progress while Q GEMMs are queued.
+        # Stream dependencies, not priority, still establish correctness.
+        _OVERLAP_STREAMS[key] = torch.cuda.Stream(device=device, priority=-1)
     return _OVERLAP_STREAMS[key]
 
 

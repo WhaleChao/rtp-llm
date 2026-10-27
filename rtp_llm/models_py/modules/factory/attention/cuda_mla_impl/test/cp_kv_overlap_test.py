@@ -37,7 +37,7 @@ class CpKvOverlapTest(unittest.TestCase):
             first = pynccl_cp.warmup_kv_overlap(group)
             for _ in range(100):
                 self.assertIs(pynccl_cp.warmup_kv_overlap(group), first)
-            stream.assert_called_once_with(device=torch.device("cuda", 0))
+            stream.assert_called_once_with(device=torch.device("cuda", 0), priority=-1)
 
     def make_wrapper(self):
         wrapper = object.__new__(cp.SparseMlaCpImpl)
@@ -185,9 +185,7 @@ class CpKvOverlapTest(unittest.TestCase):
         # The layered-cache context suppresses the writer on host-backed
         # layers; only its writeback path may publish their original buffers.
         op.write_cache_store_impl = None if host_backed else writer
-        op.attn_inputs = SimpleNamespace(
-            is_prefill=True, cache_store_inputs=object()
-        )
+        op.attn_inputs = SimpleNamespace(is_prefill=True, cache_store_inputs=object())
         op._gather = object()
         op.total_local_ids = torch.arange(0 if empty_q else 2)
         op.total_local_ids_is_identity = True
@@ -269,6 +267,8 @@ class CpKvOverlapTest(unittest.TestCase):
 
     def test_padding_and_restore_are_identical_with_independent_gather(self):
         op = object.__new__(cp.SparseMlaFp8CPOp)
+        op.use_cuda_graph = False
+        op.indexer_copy_dst_idx = torch.tensor([0, 1, 2, 8, 9])
         op._gather = SimpleNamespace(batch_size=3)
         op.sharded_local_kv_lens = torch.tensor([4, 4, 4], dtype=torch.int32)
         op.sharded_actual_local_kv_lens = torch.tensor([3, 0, 2], dtype=torch.int32)
@@ -296,18 +296,25 @@ class CpKvOverlapTest(unittest.TestCase):
 
         serial = torch.empty(7, 576, dtype=torch.bfloat16)
         asynchronous = torch.empty_like(serial)
+        graph_fallback = torch.empty_like(serial)
         with patch.object(
             cp.rtp_llm_ops,
             "cp_gather_and_upconvert_fp8_kv_cache_v2",
             side_effect=unpack,
         ), patch.object(cp, "all_gather", side_effect=gather):
-            op._gather_sharded_kv_cache(cache, serial)
+            with patch.object(op, "indexer_copy_dst_idx", None):
+                op._gather_sharded_kv_cache(cache, serial)
             op._gather_sharded_kv_cache(cache, asynchronous, gather=gather)
-        self.assertEqual(len(seen), 2)
+            # Graph replay must not consume eager-only Indexer mappings.
+            op.use_cuda_graph = True
+            op.indexer_copy_dst_idx = torch.full((5,), 99, dtype=torch.int64)
+            op._gather_sharded_kv_cache(cache, graph_fallback, gather=gather)
+        self.assertEqual(len(seen), 3)
         torch.testing.assert_close(
             serial, expected[op.sharded_kv_restore_indices], atol=0, rtol=0
         )
         torch.testing.assert_close(asynchronous, serial, atol=0, rtol=0)
+        torch.testing.assert_close(graph_fallback, serial, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
