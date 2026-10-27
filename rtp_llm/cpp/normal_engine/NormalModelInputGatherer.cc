@@ -296,9 +296,13 @@ void publishModelInputCoreTensorsToCuda(GptModelInputs& model_input, TensorHolde
     model_input.input_lengths    = publishInt32ToCuda(model_input.input_lengths, host_holder);
     model_input.sequence_lengths = publishInt32ToCuda(model_input.sequence_lengths, host_holder);
     model_input.prefix_lengths   = publishInt32ToCuda(model_input.prefix_lengths, host_holder);
-    // Migrate the 3-D KV kernel block id tensor with one H2D, replacing the
-    // former per-group tensorHoldHostAndToCuda copies in PyWrappedModel.
-    model_input.kv_cache_kernel_block_id = publishInt32ToCuda(model_input.kv_cache_kernel_block_id, host_holder);
+    // Prefill MLA planning consumes this table on CPU. Keep its pinned source
+    // through TP input sync and publish the device view at the model boundary;
+    // a GPU round-trip here would make planning wait for GPU/collective progress.
+    // Preserve the device-resident decode / mixed-batch and MTP refresh paths.
+    if (model_input.sequence_lengths.numel() != 0) {
+        model_input.kv_cache_kernel_block_id = publishInt32ToCuda(model_input.kv_cache_kernel_block_id, host_holder);
+    }
 }
 
 }  // anonymous namespace

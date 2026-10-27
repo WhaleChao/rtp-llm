@@ -407,8 +407,14 @@ void PyWrappedModel::setupKVCacheForAttentionInputs(torch_ext::PyAttentionInputs
     checkRuntimeCudaDevice(inputs.kv_cache_kernel_block_id, "kv_cache_kernel_block_id");
     checkRuntimeCudaDevice(inputs.kv_cache_block_id, "kv_cache_block_id");
     RTP_LLM_CHECK_WITH_INFO(inputs.kv_cache_kernel_block_id.dim() == 3, "kv_cache_kernel_block_id shape should be 3");
-    // New CUDA layout: [group, batch, kernel_blocks].
-    // Per-group device views are zero-copy slices; host_by_group was removed.
+    // Prefill retains the pinned CPU table through TP sync. Publish one device
+    // copy while keeping CPU planning independent of pending GPU work. Decode
+    // already owns a CUDA table and remains zero-copy.
+    auto kernel_blocks = inputs.kv_cache_kernel_block_id;
+    if (!kernel_blocks.is_cuda()) {
+        kernel_blocks = kernel_blocks.to(torch::kInt32).contiguous().pin_memory();
+    }
+    auto kernel_blocks_device = tensorHoldHostAndToCuda(kernel_blocks);
     const size_t group = inputs.kv_cache_kernel_block_id.size(0);
 
     py_attn_inputs.kv_cache_kernel_block_id_device_by_group.clear();
@@ -416,7 +422,7 @@ void PyWrappedModel::setupKVCacheForAttentionInputs(torch_ext::PyAttentionInputs
 
     for (size_t g = 0; g < group; ++g) {
         // Group view: [batch, kernel_blocks] on CUDA (no copy).
-        py_attn_inputs.kv_cache_kernel_block_id_device_by_group.push_back(inputs.kv_cache_kernel_block_id[g]);
+        py_attn_inputs.kv_cache_kernel_block_id_device_by_group.push_back(kernel_blocks_device[g]);
     }
 
     // Legacy 2-D device field defaults to group 0.
@@ -450,7 +456,7 @@ void PyWrappedModel::setupKVCacheForAttentionInputs(torch_ext::PyAttentionInputs
     const bool skip_host_kv =
         forward_uses_cuda_graph && !inputs.warmup && description_.attention_conf.kv_cache_dtype == KvCacheDataType::FP8;
     if (description_.attention_conf.use_mla && !skip_host_kv) {
-        torch::Tensor group0 = inputs.kv_cache_kernel_block_id[0];
+        torch::Tensor group0 = kernel_blocks[0];
         if (group0.device().is_cuda()) {
             group0 = group0.cpu();
         }

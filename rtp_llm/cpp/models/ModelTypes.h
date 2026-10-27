@@ -102,13 +102,14 @@ enum GptModelInputIndex : size_t {
 };
 
 // Bit positions for `tensorDeviceMap`. Only fields that participate in the
-// MTP/Eagle decode-prepare GPU path need a bit; other fields stay CPU.
+// MTP/Eagle decode-prepare GPU path, plus the prefill/decode KV table, need a bit.
 enum GptModelInputDeviceBit : uint32_t {
     kDeviceBitComboTokens     = 1u << 0,
     kDeviceBitInputLengths    = 1u << 1,
     kDeviceBitSequenceLengths = 1u << 2,
     kDeviceBitPrefixLengths   = 1u << 3,
     kDeviceBitLmOutputIndexes = 1u << 4,
+    kDeviceBitKernelBlockId   = 1u << 5,
 };
 
 void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallelism_config);
