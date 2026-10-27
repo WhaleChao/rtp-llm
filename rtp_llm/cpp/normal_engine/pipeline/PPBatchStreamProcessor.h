@@ -94,7 +94,7 @@ public:
                                                 torch::Device         device,
                                                 TensorHolder&         host_holder) const;
 
-    absl::Status dispatchExecutionResult(const StreamGroups& stream_groups, const PPExecutionResult& result) const;
+    void dispatchExecutionResult(const StreamGroups& stream_groups, const PPExecutionResult& result) const;
 
 private:
     void fillTargetVerifyModelInput(const std::list<GenerateStreamPtr>& streams, GptModelInputs& model_input) const;
@@ -125,14 +125,11 @@ private:
 
     void validateExecutionResult(const StreamGroups& stream_groups, const PPExecutionResult& result) const;
 
-    absl::Status dispatchPrefillOnlyExecutionResult(const StreamGroups&      stream_groups,
-                                                    const PPExecutionResult& result) const;
+    void dispatchPrefillOnlyExecutionResult(const StreamGroups& stream_groups, const PPExecutionResult& result) const;
 
-    absl::Status dispatchSpeculativeExecutionResult(const StreamGroups&      stream_groups,
-                                                    const PPExecutionResult& result) const;
+    void dispatchSpeculativeExecutionResult(const StreamGroups& stream_groups, const PPExecutionResult& result) const;
 
-    absl::Status dispatchNormalExecutionResult(const StreamGroups&      stream_groups,
-                                               const PPExecutionResult& result) const;
+    void dispatchNormalExecutionResult(const StreamGroups& stream_groups, const PPExecutionResult& result) const;
 
     void dispatchNormalSingleStream(const GenerateStreamPtr& stream,
                                     const PPExecutionResult& result,

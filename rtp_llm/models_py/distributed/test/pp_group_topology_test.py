@@ -1,9 +1,10 @@
-# CPU-only: validates process groups, stage capacity all-gather, and PP lane snapshot exchange via gloo.
+# CPU-only: validates group routing and stage/PP tensor all-gather with Gloo replacing NCCL.
 
 import json
 import multiprocessing as mp
 import os
 import socket
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -51,25 +52,21 @@ def _worker(rank, world_size, pp_size, dp_size, tp_size, master_port, queue):
 
         callbacks = {}
         cpp_ops = SimpleNamespace(
-            register_comm_ops=lambda broadcast, allreduce, allgather: callbacks.update(
-                allgather=allgather
-            ),
-            register_pp_ops=lambda isend, irecv, exchange: callbacks.update(
-                isend=isend, irecv=irecv, pp_snapshot_exchange=exchange
+            register_comm_ops=lambda broadcast, allreduce, allgather, isend, irecv: callbacks.update(
+                allgather=allgather, isend=isend, irecv=irecv
             ),
         )
         with patch.dict("sys.modules", {"librtp_compute_ops": cpp_ops}):
             ct._register_process_groups_to_cpp()
-            if pp_size > 1:
-                ct.register_pp_process_group(
-                    ct._get_group(ct.Group.PP),
-                    ct._get_group(ct.Group.PP, cpu_backend=True),
-                )
 
         membership = {
             str(key): torch.distributed.get_process_group_ranks(pg)
             for key, pg in ct._group_map.items()
         }
+        if pp_size > 1:
+            assert (f"PP_RESULT{cfg.dp_rank}" in membership) == (
+                cfg.tp_rank == 0 and cfg.pp_rank in (0, pp_size - 1)
+            )
         # Runtime key derivation must land on a group this rank belongs to.
         looked_up = {
             "WORLD": torch.distributed.get_process_group_ranks(
@@ -115,20 +112,70 @@ def _worker(rank, world_size, pp_size, dp_size, tp_size, master_port, queue):
             pp_index = pp_ranks.index(rank)
             next_rank = pp_ranks[(pp_index + 1) % len(pp_ranks)]
             prev_rank = pp_ranks[(pp_index - 1) % len(pp_ranks)]
+            result_values = []
+            result_thread = None
+            result_works = []
+            result_buffers = []
+            lengths = (1, 17, 5, 257)
+            if cfg.tp_rank == 0 and cfg.pp_rank == 0:
+                result_group = ct._group_map[f"PP_RESULT{cfg.dp_rank}"]
+                assert result_group is not pp_cpu_group
+                assert torch.distributed.get_process_group_ranks(result_group) == [
+                    rank,
+                    pp_ranks[-1],
+                ]
+
+                def receive_results():
+                    for length in lengths:
+                        size = torch.empty(1, dtype=torch.int64)
+                        callbacks["irecv"](
+                            size,
+                            prev_rank,
+                            ct._PP_RESULT_GROUP_NAME,
+                        ).wait()
+                        assert size.item() == length
+                        payload = torch.empty(size.item(), dtype=torch.int64)
+                        callbacks["irecv"](
+                            payload,
+                            prev_rank,
+                            ct._PP_RESULT_GROUP_NAME,
+                        ).wait()
+                        result_values.append(payload.tolist())
+
+                result_thread = threading.Thread(target=receive_results)
+                result_thread.start()
+            elif cfg.tp_rank == 0 and cfg.pp_rank == pp_size - 1:
+                for length in lengths:
+                    size = torch.tensor([length], dtype=torch.int64)
+                    payload = torch.full((length,), rank, dtype=torch.int64)
+                    result_buffers.extend((size, payload))
+                    for tensor in (size, payload):
+                        result_works.append(
+                            callbacks["isend"](
+                                tensor,
+                                next_rank,
+                                ct._PP_RESULT_GROUP_NAME,
+                            )
+                        )
+
             sent = torch.tensor([rank], dtype=torch.int64)
             received = torch.full((1,), -1, dtype=torch.int64)
-            recv_work = callbacks["irecv"](
-                received, prev_rank, ct._CPP_P2P_BACKEND_GLOO
-            )
+            recv_work = callbacks["irecv"](received, prev_rank, ct._PP_CPU_GROUP_NAME)
             send_work = callbacks["isend"](
                 sent,
                 next_rank,
-                ct._CPP_P2P_BACKEND_GLOO,
+                ct._PP_CPU_GROUP_NAME,
             )
             send_work.wait()
             recv_work.wait()
             assert received.item() == prev_rank, (rank, pp_ranks, received)
             looked_up["PP_P2P_SOURCE"] = [received.item()]
+            for work in result_works:
+                work.wait()
+            if result_thread is not None:
+                result_thread.join(timeout=30)
+                assert not result_thread.is_alive()
+                assert result_values == [[prev_rank] * length for length in lengths]
         # Each entry is a scalar-capacity case; minima fall on different TP/DP/PP ranks.
         local_blocks = [
             80 + (rank - 5) % world_size,
@@ -184,12 +231,27 @@ def _worker(rank, world_size, pp_size, dp_size, tp_size, master_port, queue):
                 gathered_blocks.append(block_nums.tolist())
                 stage_blocks.append(block_nums.min().item())
 
-        stage_snapshots = [stage_blocks]
-        if pp_size > 1:
-            payloads = callbacks["pp_snapshot_exchange"](
-                json.dumps(stage_blocks).encode()
-            )
-            stage_snapshots = [json.loads(payload) for payload in payloads]
+            stage_snapshots = [stage_blocks]
+            if pp_size > 1:
+                payload = json.dumps(stage_blocks).encode()
+                sizes = torch.empty(pp_size, dtype=torch.int64)
+                callbacks["allgather"](
+                    [sizes],
+                    ct._CPP_PARALLEL_MODE_PP,
+                    [torch.tensor([len(payload)], dtype=torch.int64)],
+                    False,
+                )
+                max_size = sizes.max().item()
+                send = torch.zeros(max_size, dtype=torch.uint8)
+                send[: len(payload)] = torch.tensor(list(payload), dtype=torch.uint8)
+                received = torch.empty((pp_size, max_size), dtype=torch.uint8)
+                callbacks["allgather"](
+                    [received], ct._CPP_PARALLEL_MODE_PP, [send], False
+                )
+                stage_snapshots = [
+                    json.loads(bytes(row[:size].tolist()))
+                    for row, size in zip(received, sizes.tolist())
+                ]
         capacities = (local_blocks, stage_blocks, stage_snapshots, gathered_blocks)
         queue.put(
             (
@@ -264,44 +326,60 @@ def _run_topology(test, pp_size, dp_size, tp_size):
 
 
 class PPGroupTopologyTest(unittest.TestCase):
-    def test_p2p_callbacks_route_by_backend(self):
+    def test_pp_callbacks_route_by_group_name(self):
         import torch
 
         from rtp_llm.models_py.distributed import collective_torch as ct
 
-        device_group, cpu_group = object(), object()
+        device_group, cpu_group, result_group = (
+            object(),
+            object(),
+            object(),
+        )
+        groups = {
+            ct._PP_DEVICE_GROUP_NAME: device_group,
+            ct._PP_CPU_GROUP_NAME: cpu_group,
+            ct._PP_RESULT_GROUP_NAME: result_group,
+        }
+        group_ranks = {
+            device_group: [0, 1, 2],
+            cpu_group: [0, 1, 2],
+            result_group: [0, 2],
+        }
         callbacks = {}
         cpp_ops = SimpleNamespace(
-            register_pp_ops=lambda isend, irecv, exchange: callbacks.update(
+            register_comm_ops=lambda broadcast, allreduce, allgather, isend, irecv: callbacks.update(
                 isend=isend, irecv=irecv
-            )
+            ),
         )
+        cfg = SimpleNamespace(world_size=3, pp_size=3, dp_size=1, tp_size=1, dp_rank=0)
         with patch.dict("sys.modules", {"librtp_compute_ops": cpp_ops}), patch.object(
-            torch.distributed, "get_process_group_ranks", return_value=[0, 1]
+            ct, "_parallelism_config", cfg
+        ), patch.object(ct, "_group_map", {"PP_RESULT0": result_group}), patch.object(
+            ct,
+            "_get_group",
+            side_effect=lambda group, cpu_backend=False: (
+                cpu_group if cpu_backend else device_group
+            ),
+        ), patch.object(
+            torch.distributed, "get_rank", return_value=0
         ):
-            ct.register_pp_process_group(device_group, cpu_group)
+            ct._register_process_groups_to_cpp()
 
         tensor = object()
         for operation, peer_arg in (("isend", "dst"), ("irecv", "src")):
             with patch.object(
                 torch.distributed, operation, return_value=object()
             ) as p2p_op:
-                for backend, group in (
-                    (ct._CPP_P2P_BACKEND_NCCL, device_group),
-                    (ct._CPP_P2P_BACKEND_GLOO, cpu_group),
-                ):
-                    with self.subTest(operation=operation, backend=backend):
+                for group_name, group in groups.items():
+                    peer = group_ranks[group][-1]
+                    with self.subTest(operation=operation, group_name=group_name):
                         p2p_op.reset_mock()
-                        work = callbacks[operation](tensor, 1, backend)
+                        work = callbacks[operation](tensor, peer, group_name)
                         p2p_op.assert_called_once_with(
-                            tensor, **{peer_arg: 1, "group": group}
+                            tensor, **{peer_arg: peer, "group": group}
                         )
                         self.assertIs(work, p2p_op.return_value)
-
-                p2p_op.reset_mock()
-                with self.assertRaisesRegex(ValueError, "Unsupported P2P backend"):
-                    callbacks[operation](tensor, 1, -1)
-                p2p_op.assert_not_called()
 
     @staticmethod
     def _merge(results):
@@ -320,7 +398,7 @@ class PPGroupTopologyTest(unittest.TestCase):
             with self.subTest(tp_size=tp_size, dp_size=dp_size):
                 _run_topology(self, pp_size=1, dp_size=dp_size, tp_size=tp_size)
 
-    def test_pp1_dp2_tp2_matches_historical_groups(self):
+    def test_pp1_dp2_tp2_uses_world_stage_and_local_dp_tp_groups(self):
         results = _run_topology(self, pp_size=1, dp_size=2, tp_size=2)
         membership = self._merge(results)
         self.assertEqual(membership["TP0"], [0, 1])
@@ -379,6 +457,8 @@ class PPGroupTopologyTest(unittest.TestCase):
         self.assertEqual(membership["PP1"], [1, 5])
         self.assertEqual(membership["PP2"], [2, 6])
         self.assertEqual(membership["PP3"], [3, 7])
+        self.assertEqual(membership["PP_RESULT0"], [0, 4])
+        self.assertEqual(membership["PP_RESULT1"], [2, 6])
         self.assertEqual(results[0][4]["TP"], [0, 1])
         self.assertEqual(results[0][4]["DP"], [0, 2])
         self.assertEqual(results[0][4]["PP"], [0, 4])
@@ -408,6 +488,12 @@ class PPGroupTopologyTest(unittest.TestCase):
                 [min(column) for column in zip(*stage_snapshots)], [80, 96, 112, 128]
             )
 
+    def test_pp3_dp2_tp1_results_skip_middle_stage(self):
+        results = _run_topology(self, pp_size=3, dp_size=2, tp_size=1)
+        membership = self._merge(results)
+        self.assertEqual(membership["PP_RESULT0"], [0, 4])
+        self.assertEqual(membership["PP_RESULT1"], [1, 5])
+
     def test_pp2_dp2_tp1_stage_reuses_dp(self):
         results = _run_topology(self, pp_size=2, dp_size=2, tp_size=1)
         membership = self._merge(results)
@@ -426,6 +512,7 @@ class PPGroupTopologyTest(unittest.TestCase):
         membership = self._merge(results)
         self.assertEqual(membership["PP0"], [0, 1])
         self.assertEqual(membership["PP0_gloo"], [0, 1])
+        self.assertEqual(membership["PP_RESULT0"], [0, 1])
         for rank in range(2):
             self.assertEqual(membership[f"TP{rank}"], [rank])
             self.assertEqual(membership[f"DP{rank}"], [rank])

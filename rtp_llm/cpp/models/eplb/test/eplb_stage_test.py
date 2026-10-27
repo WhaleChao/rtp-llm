@@ -97,7 +97,6 @@ def run_rank(rank, pp_size, port):
         assert result["metrics_gpu_loads"] == [rank + 1] * (end - begin), result
     finally:
         test_ops.clear_comm_ops()
-        test_ops.clear_pp_ops()
         dist.destroy_process_group()
 
 

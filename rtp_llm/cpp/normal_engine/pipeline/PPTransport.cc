@@ -2,6 +2,8 @@
 
 #include <utility>
 
+#include <ATen/record_function.h>
+
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 
@@ -31,22 +33,34 @@ TorchDistributedPPTransport::TorchDistributedPPTransport(int64_t previous_rank, 
 #endif
 }
 
-std::unique_ptr<PPCommTicket> TorchDistributedPPTransport::asyncSend(const torch::Tensor& tensor) {
+std::unique_ptr<PPCommTicket> TorchDistributedPPTransport::asyncSend(const torch::Tensor& tensor,
+                                                                     const std::string&   group_name) {
 #if USING_CUDA
-    const auto backend = tensor.is_cuda() ? P2PBackend::NCCL : P2PBackend::GLOO;
-    return std::make_unique<PPCommTicket>(execISend(tensor, next_rank_, backend));
+    if (tensor.is_cpu()) {
+        /** PP CPU groups use Gloo; deferred wait() callbacks must not retain per-step profiler storage. */
+        at::DisableRecordFunctionGuard record_guard;
+        return std::make_unique<PPCommTicket>(execISend(tensor, next_rank_, group_name));
+    }
+    return std::make_unique<PPCommTicket>(execISend(tensor, next_rank_, group_name));
 #else
     (void)tensor;
+    (void)group_name;
     RTP_LLM_FAIL("TorchDistributedPPTransport requires a CUDA build");
 #endif
 }
 
-std::unique_ptr<PPCommTicket> TorchDistributedPPTransport::asyncReceive(torch::Tensor& tensor) {
+std::unique_ptr<PPCommTicket> TorchDistributedPPTransport::asyncReceive(torch::Tensor&     tensor,
+                                                                        const std::string& group_name) {
 #if USING_CUDA
-    const auto backend = tensor.is_cuda() ? P2PBackend::NCCL : P2PBackend::GLOO;
-    return std::make_unique<PPCommTicket>(execIRecv(tensor, previous_rank_, backend));
+    if (tensor.is_cpu()) {
+        /** PP CPU groups use Gloo; deferred wait() callbacks must not retain per-step profiler storage. */
+        at::DisableRecordFunctionGuard record_guard;
+        return std::make_unique<PPCommTicket>(execIRecv(tensor, previous_rank_, group_name));
+    }
+    return std::make_unique<PPCommTicket>(execIRecv(tensor, previous_rank_, group_name));
 #else
     (void)tensor;
+    (void)group_name;
     RTP_LLM_FAIL("TorchDistributedPPTransport requires a CUDA build");
 #endif
 }

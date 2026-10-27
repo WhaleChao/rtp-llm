@@ -32,8 +32,6 @@ __all__: list[str] = [
     "init_exec_ctx",
     "register_comm_ops",
     "clear_comm_ops",
-    "register_pp_ops",
-    "clear_pp_ops",
     "init_cpu_tp_broadcaster",
     "destroy_cpu_tp_broadcaster",
     "rtp_llm_ops",
@@ -499,7 +497,13 @@ def init_exec_ctx(
     mla_ops_type: int,
 ) -> None: ...
 
-def register_comm_ops(broadcast_fn: typing.Callable, allreduce_fn: typing.Callable, allgather_fn: typing.Callable) -> None:
+def register_comm_ops(
+    broadcast_fn: typing.Callable,
+    allreduce_fn: typing.Callable,
+    allgather_fn: typing.Callable,
+    isend_fn: typing.Callable[[torch.Tensor, int, str], typing.Any],
+    irecv_fn: typing.Callable[[torch.Tensor, int, str], typing.Any],
+) -> None:
     """
     Register Python callbacks for C++ communication ops.
     """
@@ -508,15 +512,6 @@ def clear_comm_ops() -> None:
     """
     Clear registered Python communication callbacks.
     """
-
-def register_pp_ops(
-    isend_fn: typing.Callable[[torch.Tensor, int, int], typing.Any],
-    irecv_fn: typing.Callable[[torch.Tensor, int, int], typing.Any],
-    pp_snapshot_exchange_fn: typing.Callable,
-) -> None:
-    """Register P2P callbacks taking (tensor, global_peer, backend: 0=NCCL, 1=GLOO)."""
-
-def clear_pp_ops() -> None: ...
 
 def init_cpu_tp_broadcaster(tp_rank: int, tp_size: int, base_path: str) -> None: ...
 def destroy_cpu_tp_broadcaster() -> None: ...

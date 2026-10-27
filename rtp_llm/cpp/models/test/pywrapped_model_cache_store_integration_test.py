@@ -439,6 +439,8 @@ def _register_no_collectives(allreduce=None) -> None:
         unexpected_collective,
         unexpected_collective if allreduce is None else allreduce,
         unexpected_collective,
+        unexpected_collective,
+        unexpected_collective,
     )
 
 
@@ -881,7 +883,11 @@ class TpSyncModelInputsIntegrationTest(unittest.TestCase):
                         frames.extend(tensor.clone() for tensor in tensors)
 
                     register_comm_ops(
-                        record_broadcast, unexpected_collective, unexpected_collective
+                        record_broadcast,
+                        unexpected_collective,
+                        unexpected_collective,
+                        unexpected_collective,
+                        unexpected_collective,
                     )
                     results = run_tp_sync_model_inputs_scenario(
                         0,
@@ -916,6 +922,8 @@ class TpSyncModelInputsIntegrationTest(unittest.TestCase):
                             # Replay actual root broadcasts, not independently encoded hints.
                             register_comm_ops(
                                 replay_broadcast,
+                                unexpected_collective,
+                                unexpected_collective,
                                 unexpected_collective,
                                 unexpected_collective,
                             )

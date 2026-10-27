@@ -1878,7 +1878,9 @@ public:
                 EXPECT_TRUE(dest.is_none());
                 return torch::full_like(status, reduce(status.item<int32_t>() != 0));
             }),
-            py::cpp_function([](py::args) { ADD_FAILURE() << "unexpected allgather"; }));
+            py::cpp_function([](py::args) { ADD_FAILURE() << "unexpected allgather"; }),
+            py::cpp_function([](py::args) { ADD_FAILURE() << "unexpected isend"; }),
+            py::cpp_function([](py::args) { ADD_FAILURE() << "unexpected irecv"; }));
     }
 
     ~PublicationCollectives() {

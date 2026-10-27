@@ -455,7 +455,7 @@ absl::StatusOr<GenerateStreamPtr> NormalEngine::preRun(const std::shared_ptr<Gen
         auto* pp_executor = static_cast<PPExecutor*>(executor_.get());
         THROW_IF_STATUS_ERROR(pp_executor->process(schedule_output));
         if (mode == preRunMode::build_system_prompt) {
-            THROW_IF_STATUS_ERROR(pp_executor->drainPendingResults());
+            pp_executor->drainPendingResults();
 
             /** Retire tail state before reusing the request ID. Control-only cleanup runs no model and returns no
              * result. */
@@ -864,7 +864,7 @@ void NormalEngine::initCacheManager(std::optional<WarmUpResult> warm_up_result) 
         config, model_config_, runtime_config, kv_cache_config, parallelism_config, warm_up_result, sp_config);
     const auto confirmed_block_num = CacheConfigCreator::synchronizeBlockNum(local_block_num, parallelism_config);
     if (parallelism_config.pp_size > 1) {
-        PPCacheCapacityNegotiator negotiator;
+        PPCacheCapacityNegotiator negotiator(parallelism_config.pp_size);
         const auto                capacity = negotiator.negotiate(
             config, confirmed_block_num, block_tree_layout->local_combined_stride_bytes, runtime_config);
         block_tree_layout->capacity_stride_bytes = capacity.block_tree_combined_stride_bytes;
@@ -1186,8 +1186,8 @@ absl::Status NormalEngine::pp_step() {
             mayAddFakeStream(streams);
         }
 
-        /** Fake streams participate in cross-DP model communication. Even without one, an empty plan must advance
-         * PP slots and receive pending results. */
+        /** Fake streams participate in cross-DP model communication. Without a fake stream, an empty plan still
+         * advances the PP execution round; result reception progresses independently on the result thread. */
     }
 
     RTP_LLM_LOG_DEBUG(__PRETTY_FUNCTION__);

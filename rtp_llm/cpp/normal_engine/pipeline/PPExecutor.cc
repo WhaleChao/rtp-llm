@@ -9,6 +9,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include <c10/core/InferenceMode.h>
+
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/config/StageLayerRange.h"
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
@@ -119,35 +121,26 @@ GenerateStreamPtr PPExecutor::createMinFakeDecodeStream(const ModelConfig&      
     return fake_stream;
 }
 
-void PPExecutor::InflightBatch::reset() {
-    tps_active_guard      = {};
-    wall_tps_active_guard = {};
-    result_pending        = false;
-    stream_groups         = StreamGroups();
-    schedule_time_us      = 0;
-    executor_collector    = RtpLLMExecutorMetricsCollector();
-}
-
-void PPExecutor::sendObject(const torch::Tensor& object, PPTickets& tickets) {
+void PPExecutor::asyncSendObject(const torch::Tensor& object, PPTickets& tickets, const std::string& group_name) {
     auto object_size = torch::tensor({object.numel()}, torch::kInt64);
-    tickets.push_back(transport_->asyncSend(object_size));
-    tickets.push_back(transport_->asyncSend(object));
+    tickets.push_back(transport_->asyncSend(object_size, group_name));
+    tickets.push_back(transport_->asyncSend(object, group_name));
 }
 
-torch::Tensor PPExecutor::receiveObject() {
+torch::Tensor PPExecutor::receiveObject(const std::string& group_name) {
     auto object_size  = torch::empty({1}, torch::TensorOptions().dtype(torch::kInt64));
-    auto size_receive = transport_->asyncReceive(object_size);
+    auto size_receive = transport_->asyncReceive(object_size, group_name);
     size_receive->wait();
 
     auto object         = torch::empty({object_size.item<int64_t>()}, torch::TensorOptions().dtype(torch::kUInt8));
-    auto object_receive = transport_->asyncReceive(object);
+    auto object_receive = transport_->asyncReceive(object, group_name);
     object_receive->wait();
     return object;
 }
 
 void PPExecutor::asyncSendPlan(const torch::Tensor& plan_payload, PPTickets& tickets) {
     RTP_LLM_PROFILE_SCOPE("executor.pp.send_plan");
-    sendObject(plan_payload, tickets);
+    asyncSendObject(plan_payload, tickets);
 }
 
 PPExecutionPlan PPExecutor::receivePlan(torch::Tensor& plan_payload) {
@@ -177,17 +170,18 @@ PPExecutionPlan PPExecutor::receivePlan(torch::Tensor& plan_payload) {
 
 void PPExecutor::asyncSendExecutionResult(const PPExecutionResult& result, PPTickets& tickets) {
     RTP_LLM_PROFILE_SCOPE("executor.pp.send_result");
-    sendObject(pp_serialization::serializeExecutionResult(result), tickets);
+    asyncSendObject(pp_serialization::serializeExecutionResult(result), tickets, kPPResultGroupName);
 }
 
 void PPExecutor::asyncSendTensors(const PPIntermediateTensors& tensors, PPTickets& tickets) {
     RTP_LLM_PROFILE_SCOPE("executor.pp.send_activations");
-    sendObject(pp_serialization::serializeTensorsMetadata(tensors), tickets);
+    asyncSendObject(pp_serialization::serializeTensorsMetadata(tensors), tickets);
     for (const auto& tensor_entry : tensors.tensors) {
         if (tensor_entry.second.numel() != 0) {
             /** Snapshot on the compute stream so model buffers can be reused while NCCL sends the ticket-owned copy. */
             auto snapshot = tensor_entry.second.clone(torch::MemoryFormat::Contiguous);
-            tickets.push_back(transport_->asyncSend(snapshot));
+            const auto& group_name = snapshot.is_cuda() ? kPPDeviceGroupName : kPPCpuGroupName;
+            tickets.push_back(transport_->asyncSend(snapshot, group_name));
         }
     }
 }
@@ -201,7 +195,8 @@ PPIntermediateTensors PPExecutor::receiveTensors() {
         tensors = pp_serialization::deserializeTensorsMetadata(receiveObject(), recv_buffers_[next_recv_buffer_]);
         for (auto& tensor_entry : tensors.tensors) {
             if (tensor_entry.second.numel() != 0) {
-                tickets.push_back(transport_->asyncReceive(tensor_entry.second));
+                const auto& group_name = tensor_entry.second.is_cuda() ? kPPDeviceGroupName : kPPCpuGroupName;
+                tickets.push_back(transport_->asyncReceive(tensor_entry.second, group_name));
             }
         }
     }
@@ -238,39 +233,6 @@ void PPExecutor::reapCompletedActivationSends() {
             }
         }
     }
-}
-
-absl::Status PPExecutor::processExecutionResult(InflightBatch& batch) {
-    /** Release activity after reporting, including dispatch failures and receive exceptions. */
-    auto tps_active_guard      = std::move(batch.tps_active_guard);
-    auto wall_tps_active_guard = std::move(batch.wall_tps_active_guard);
-    /** Fake batches still complete the PP round trip before their result is discarded. */
-    PPExecutionResult result;
-    {
-        RTP_LLM_PROFILE_SCOPE("executor.pp.recv_result");
-        result = pp_serialization::deserializeExecutionResult(receiveObject());
-    }
-    batch.result_pending = false;
-    if (batch.stream_groups.isFakeStream()) {
-        RTP_LLM_LOG_DEBUG("PP fake batch completed: dp_rank=%ld", parallelism_config_.dp_rank);
-        return absl::OkStatus();
-    }
-
-    /** Count input work and returned tokens before dispatch changes stream state. */
-    StreamGroups::TokenCountsByPriority     token_counts_by_priority;
-    RtpLLMSpeculativeEngineMetricsCollector sp_collector;
-    collectTokenCounts(batch.stream_groups, result, token_counts_by_priority, sp_collector);
-
-    {
-        RTP_LLM_PROFILE_SCOPE("executor.pp.dispatch_result");
-        const auto start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
-        RETURN_IF_STATUS_ERROR(batch_stream_processor_->dispatchExecutionResult(batch.stream_groups, result));
-        batch.executor_collector.dispatch_output_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
-    }
-
-    batch.executor_collector.sample_input_us = result.sample_input_us;
-    reportResultMetrics(batch, token_counts_by_priority, sp_collector);
-    return absl::OkStatus();
 }
 
 void PPExecutor::validateConfig(const EngineInitParams& params) const {
@@ -561,17 +523,21 @@ PPExecutor::PPExecutor(const EngineInitParams&                params,
                                  params.grammar_config,
                                  params.sp_config.tree_decode_config,
                                  isFirstStage() && isStageRoot() && !warm_up_ ? metrics_reporter_ : nullptr);
+    if (!warm_up_ && isFirstStage() && isStageRoot()) {
+        result_thread_ = std::thread(&PPExecutor::resultLoop, this);
+    }
     cudaProfilerBegin();
 }
 
 PPExecutor::~PPExecutor() {
+    if (isFirstStage() && isStageRoot()) {
+        requestResultStop();
+        if (result_thread_.joinable()) {
+            result_thread_.join();
+        }
+    }
     /** Finish local model-buffer consumers before destroying the models. */
     last_compute_done_.synchronize();
-    /** Reporters are destroyed before slots_; release guards while their reporters are still alive. */
-    for (auto& slot : slots_) {
-        slot.tps_active_guard      = {};
-        slot.wall_tps_active_guard = {};
-    }
     cudaProfilerEnd();
 }
 
@@ -1126,24 +1092,14 @@ absl::Status PPExecutor::process(const ScheduleOutput& schedule_output, int64_t 
     return absl::OkStatus();
 }
 
-absl::Status PPExecutor::drainPendingResults() {
-    /** current_slot_ is the oldest position after processImpl advances the ring. Skip completed and non-result plans.
-     */
-    for (size_t offset = 0; offset < slots_.size(); ++offset) {
-        auto& batch = slots_[(current_slot_ + offset) % slots_.size()];
-        if (batch.result_pending) {
-            RETURN_IF_STATUS_ERROR(processExecutionResult(batch));
-        }
-    }
-    return absl::OkStatus();
-}
-
 absl::Status PPExecutor::finish() {
     ScheduleOutput empty_output;
     if (isFirstStage() && isStageRoot()) {
         /** An empty terminal plan skips model execution while preserving TP sync and downstream plan propagation. */
         RETURN_IF_STATUS_ERROR(processImpl(empty_output, 0, true));
-        RETURN_IF_STATUS_ERROR(drainPendingResults());
+        if (result_thread_.joinable()) {
+            result_thread_.join();
+        }
     } else {
         /** Local stop may precede the terminal plan; keep serving upstream until it has been processed. */
         while (!stopped_) {
@@ -1157,9 +1113,13 @@ absl::Status PPExecutor::finish() {
     }
     /** NCCL wait only orders the current stream; complete it before model/transport teardown. */
     cuda_graph::graphGetCurrentStream().synchronize();
-    token_history_lengths_.clear();
-    sampling_states_.clear();
-    dspark_q_.clear();
+    if (isFirstStage() && isStageRoot()) {
+        token_history_lengths_.clear();
+    }
+    if (isLastStage() && isStageRoot()) {
+        sampling_states_.clear();
+        dspark_q_.clear();
+    }
     RTP_LLM_LOG_INFO("PP shutdown completed: pp_rank=%ld, tp_rank=%ld, dp_rank=%ld",
                      parallelism_config_.pp_rank,
                      parallelism_config_.tp_rank,
@@ -1208,6 +1168,12 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
         executor_collector.plan_wait_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
 
+    /** 2. Forward before TP sync; keep new tickets out of slot-reuse waits. */
+    PPTickets pending_plan_sends;
+    if (!isLastStage()) {
+        asyncSendPlan(plan_payload, pending_plan_sends);
+    }
+
     if (isLastStage() && isStageRoot()) {
         for (const auto request_id : plan.finished_request_ids) {
             sampling_states_.erase(request_id);
@@ -1224,7 +1190,7 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
         grammar_prefetch = batch_stream_processor_->prepareLogitsProcessorsAsync(plan.sampling_plan, sampling_states_);
     }
 
-    /** 2. Synchronize model inputs across TP ranks in this stage. */
+    /** 3. Synchronize model inputs across TP ranks in this stage. */
     {
         RTP_LLM_PROFILE_SCOPE("executor.pp.tp_sync_input");
         const auto start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
@@ -1233,7 +1199,7 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
     }
     const bool prefill_only = model_input.skip_lm_head;
 
-    /** 3. Wait on this slot's previous sends before resetting it. CUDA waits order subsequent operations on the current
+    /** 4. Wait on this slot's previous sends before reusing it. CUDA waits order subsequent operations on the current
      * stream after communication. */
     auto& inflight = slots_[current_slot_];
     {
@@ -1244,18 +1210,7 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
         waitAll(inflight.execution_result_sends);
         executor_collector.slot_reuse_wait_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
-    inflight.reset();
-    if (isFirstStage() && isStageRoot()) {
-        /** Keep first-stage receives paired with last-stage sends, including ordinary fake batches. */
-        inflight.result_pending   = !model_input.skip_run;
-        inflight.stream_groups    = std::move(scheduled_stream_groups);
-        inflight.schedule_time_us = schedule_time_us;
-    }
-
-    /** 4. Forward the CPU plan payload to the next stage. */
-    if (!isLastStage()) {
-        asyncSendPlan(plan_payload, inflight.plan_sends);
-    }
+    inflight.plan_sends = std::move(pending_plan_sends);
 
     /** 5. run the batch. */
     if (model_input.skip_run) {
@@ -1383,9 +1338,7 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
             }
         }
         last_compute_done_.record(cuda_graph::graphGetCurrentStream());
-        if (isFirstStage() && isStageRoot()) {
-            inflight.executor_collector = executor_collector;
-        } else if (isStageRoot()) {
+        if (!isFirstStage() && isStageRoot()) {
             reportStageMetrics(executor_collector);
         }
         if (profile_step_finish_) {
@@ -1393,22 +1346,102 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
         }
     }
 
-    /** A submitted real batch remains active even when later rounds contain only empty or fake plans. */
-    if (report_active && inflight.result_pending && !inflight.stream_groups.isFakeStream()) {
-        inflight.tps_active_guard      = std::move(tps_active_guard);
-        inflight.wall_tps_active_guard = std::move(wall_tps_active_guard);
+    if (isFirstStage() && isStageRoot() && !model_input.skip_run) {
+        enqueueResultTask({std::move(scheduled_stream_groups),
+                           schedule_time_us,
+                           std::move(executor_collector),
+                           std::move(tps_active_guard),
+                           std::move(wall_tps_active_guard)});
     }
 
     current_slot_ = (current_slot_ + 1) % slots_.size();
 
-    /** 6. recv the execution result of next batch and process it. */
-    auto& next_batch = slots_[current_slot_];
-    if (isFirstStage() && isStageRoot() && next_batch.result_pending) {
-        RETURN_IF_STATUS_ERROR(processExecutionResult(next_batch));
+    if (model_input.shutdown) {
+        stopped_ = true;
+        if (isFirstStage() && isStageRoot()) {
+            requestResultStop();
+        }
+    }
+    return absl::OkStatus();
+}
+
+void PPExecutor::enqueueResultTask(ResultTask task) {
+    {
+        std::lock_guard<std::mutex> lock(result_mutex_);
+        result_tasks_.push_back(std::move(task));
+    }
+    result_cv_.notify_one();
+}
+
+void PPExecutor::resultLoop() {
+    cuda_graph::setDevice(static_cast<int>(recv_stream_.device_index()));
+    /** Inference mode is thread-local; dispatch updates tensors created by the engine thread. */
+    c10::InferenceMode inference_guard(true);
+    while (true) {
+        {
+            ResultTask task;
+            {
+                std::unique_lock<std::mutex> lock(result_mutex_);
+                result_cv_.wait(lock, [this] { return result_stop_ || !result_tasks_.empty(); });
+                if (result_tasks_.empty()) {
+                    return;
+                }
+                task = std::move(result_tasks_.front());
+                result_tasks_.pop_front();
+                result_processing_ = true;
+            }
+            receiveAndProcessResult(task.stream_groups, task.schedule_time_us, task.executor_collector);
+            /** Drain must include stream and guard cleanup; destroy the task before marking it idle. */
+        }
+        {
+            std::lock_guard<std::mutex> lock(result_mutex_);
+            result_processing_ = false;
+        }
+        result_cv_.notify_all();
+    }
+}
+
+void PPExecutor::receiveAndProcessResult(const StreamGroups&             stream_groups,
+                                         int64_t                         schedule_time_us,
+                                         RtpLLMExecutorMetricsCollector& executor_collector) {
+    /** Fake batches still complete the PP round trip before their result is discarded. */
+    PPExecutionResult result;
+    {
+        RTP_LLM_PROFILE_SCOPE("executor.pp.recv_result");
+        result = pp_serialization::deserializeExecutionResult(receiveObject(kPPResultGroupName));
+    }
+    if (stream_groups.isFakeStream()) {
+        RTP_LLM_LOG_DEBUG("PP fake batch completed: dp_rank=%ld", parallelism_config_.dp_rank);
+        return;
     }
 
-    stopped_ = model_input.shutdown;
-    return absl::OkStatus();
+    /** Count input work and returned tokens before dispatch changes stream state. */
+    StreamGroups::TokenCountsByPriority     token_counts_by_priority;
+    RtpLLMSpeculativeEngineMetricsCollector sp_collector;
+    collectTokenCounts(stream_groups, result, token_counts_by_priority, sp_collector);
+
+    {
+        RTP_LLM_PROFILE_SCOPE("executor.pp.dispatch_result");
+        const auto start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        batch_stream_processor_->dispatchExecutionResult(stream_groups, result);
+        executor_collector.dispatch_output_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+    }
+
+    executor_collector.sample_input_us = result.sample_input_us;
+    reportResultMetrics(stream_groups, schedule_time_us, executor_collector, token_counts_by_priority, sp_collector);
+}
+
+void PPExecutor::drainPendingResults() {
+    std::unique_lock<std::mutex> lock(result_mutex_);
+    result_cv_.wait(lock, [this] { return result_tasks_.empty() && !result_processing_; });
+}
+
+void PPExecutor::requestResultStop() {
+    {
+        std::lock_guard<std::mutex> lock(result_mutex_);
+        result_stop_ = true;
+    }
+    result_cv_.notify_all();
 }
 
 bool PPExecutor::updateEplbConfig(const EPLBConfig& config) {
@@ -1479,21 +1512,22 @@ void PPExecutor::collectTokenCounts(const StreamGroups&                      str
     }
 }
 
-void PPExecutor::reportResultMetrics(InflightBatch&                             batch,
+void PPExecutor::reportResultMetrics(const StreamGroups&                        stream_groups,
+                                     int64_t                                    schedule_time_us,
+                                     RtpLLMExecutorMetricsCollector&            executor_collector,
                                      const StreamGroups::TokenCountsByPriority& token_counts_by_priority,
                                      RtpLLMSpeculativeEngineMetricsCollector&   sp_collector) {
     if (!metrics_reporter_ || warm_up_ || !isFirstStage() || !isStageRoot()) {
         return;
     }
-    const int64_t batch_latency_us = autil::TimeUtility::currentTimeInMicroSeconds() - batch.schedule_time_us;
+    const int64_t batch_latency_us = autil::TimeUtility::currentTimeInMicroSeconds() - schedule_time_us;
     if (batch_latency_us <= 0) {
         return;
     }
 
     /** First-stage executor timings tagged pp_rank=0; other stages report their own via reportStageMetrics.
      * This deferred report also carries the result-time dispatch and the returned last-stage sampling. */
-    metrics_reporter_->report<RtpLLMExecutorMetrics, RtpLLMExecutorMetricsCollector>(nullptr,
-                                                                                     &batch.executor_collector);
+    metrics_reporter_->report<RtpLLMExecutorMetrics, RtpLLMExecutorMetricsCollector>(nullptr, &executor_collector);
 
     int64_t generate_tokens = 0;
     int64_t total_tokens    = 0;
@@ -1502,8 +1536,8 @@ void PPExecutor::reportResultMetrics(InflightBatch&                             
         total_tokens += entry.second.total;
     }
     RtpLLMTokenPSMetricsCollector tps_collector;
-    tps_collector.addTokenSize(batch.stream_groups.contextExecuteTokenSize(),
-                               batch.stream_groups.contextExecuteTokenSizeWithCache(),
+    tps_collector.addTokenSize(stream_groups.contextExecuteTokenSize(),
+                               stream_groups.contextExecuteTokenSizeWithCache(),
                                generate_tokens,
                                total_tokens,
                                batch_latency_us);

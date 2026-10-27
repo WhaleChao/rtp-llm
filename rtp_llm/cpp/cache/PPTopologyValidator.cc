@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/cache/PPTopologyValidator.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <unordered_map>
@@ -352,13 +353,26 @@ PPValidationResult initPPCacheGeometry(StageSnapshotCollector& collector) {
 }
 
 std::vector<StageCacheSnapshot> PPSnapshotCollector::collect() {
-    const auto payloads = execPPSnapshotExchange(local_.serialize());
-    RTP_LLM_CHECK_WITH_INFO(!payloads.empty(), "PP snapshot exchange returned no stages");
+    const auto payload    = local_.serialize();
+    const auto local_size = torch::tensor({static_cast<int64_t>(payload.size())}, torch::kInt64);
+    auto       sizes      = torch::empty({pp_size_}, torch::kInt64);
+    execAllGather({{sizes}, ParallelMode::PP, {local_size}, false});
+
+    // The existing tensor all-gather stages CPU buffers through NCCL and copies them back before returning.
+    const auto* size_data = sizes.data_ptr<int64_t>();
+    const auto  max_size  = *std::max_element(size_data, size_data + pp_size_);
+    auto        send      = torch::zeros({max_size}, torch::kUInt8);
+    std::memcpy(send.data_ptr(), payload.data(), payload.size());
+    auto received = torch::empty({pp_size_, max_size}, torch::kUInt8);
+    execAllGather({{received}, ParallelMode::PP, {send}, false});
+
+    const auto*                     data = received.data_ptr<uint8_t>();
     std::vector<StageCacheSnapshot> stages;
-    stages.reserve(payloads.size());
-    for (size_t s = 0; s < payloads.size(); ++s) {
+    stages.reserve(static_cast<size_t>(pp_size_));
+    for (size_t s = 0; s < static_cast<size_t>(pp_size_); ++s) {
         try {
-            stages.push_back(StageCacheSnapshot::deserialize(payloads[s]));
+            stages.push_back(StageCacheSnapshot::deserialize(
+                std::string(reinterpret_cast<const char*>(data + s * max_size), size_data[s])));
         } catch (const std::exception& e) {
             RTP_LLM_FAIL("PP snapshot exchange: stage %zu payload rejected: %s", s, e.what());
         }
@@ -378,7 +392,7 @@ NegotiatedCapacity PPCacheCapacityNegotiator::negotiate(const CacheConfig&   top
     sized.mtp_sub_configs.clear();
     sized.finalizeBlockNums(local_block_num, runtime_config);
     auto                snapshot = StageCacheSnapshot::captureLocalStage(sized, local_block_tree_combined_stride_bytes);
-    PPSnapshotCollector collector(std::move(snapshot));
+    PPSnapshotCollector collector(std::move(snapshot), pp_size_);
     auto                validation = initPPCacheGeometry(collector);
     if (!validation.ok) {
         RTP_LLM_FAIL("PP cache topology validation failed: %s", validation.error.c_str());

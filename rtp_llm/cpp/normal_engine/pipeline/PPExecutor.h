@@ -1,10 +1,14 @@
 #pragma once
 
 #include <array>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -52,6 +56,10 @@ struct PPSamplingState {
 };
 using SamplingStates = std::unordered_map<RequestId, PPSamplingState>;
 
+using TpsActiveGuard = MetricsLoopReporter<RtpLLMTokenPSMetrics, RtpLLMTokenPSMetricsCollector>::ActiveGuard;
+using WallTpsActiveGuard =
+    WallClockMetricsLoopReporter<RtpLLMWallClockTokenPSMetrics, RtpLLMTokenPSMetricsCollector>::ActiveGuard;
+
 class PPExecutor final: public Executor {
 public:
     PPExecutor(const EngineInitParams&                params,
@@ -66,8 +74,7 @@ public:
 
     absl::Status process(const ScheduleOutput& schedule_output, int64_t schedule_time_us = 0) override;
 
-    /** First-stage root receives pending results in submission order without sending plans or advancing the ring. */
-    absl::Status drainPendingResults();
+    void drainPendingResults();
 
     absl::Status finish() override;
 
@@ -101,26 +108,33 @@ private:
     int64_t firstLocalMoeLayer(const ModelConfig& model_config) const;
 
     struct InflightBatch {
-        bool                           result_pending = false;
-        StreamGroups                   stream_groups;
-        int64_t                        schedule_time_us = 0;
-        RtpLLMExecutorMetricsCollector executor_collector;
-
-        /** Keep both reporters active across process calls until this batch's result is handled. */
-        MetricsLoopReporter<RtpLLMTokenPSMetrics, RtpLLMTokenPSMetricsCollector>::ActiveGuard tps_active_guard;
-        WallClockMetricsLoopReporter<RtpLLMWallClockTokenPSMetrics, RtpLLMTokenPSMetricsCollector>::ActiveGuard
-            wall_tps_active_guard;
-
         PPTickets plan_sends;
         PPTickets activation_sends;
         PPTickets execution_result_sends;
+    };
 
-        void reset();
+    struct ResultTask {
+        StreamGroups                   stream_groups;
+        int64_t                        schedule_time_us = 0;
+        RtpLLMExecutorMetricsCollector executor_collector;
+        TpsActiveGuard                 tps_active_guard;
+        WallTpsActiveGuard             wall_tps_active_guard;
     };
 
     absl::Status warmUp(const ScheduleOutput& schedule_output);
 
     absl::Status processImpl(const ScheduleOutput& schedule_output, int64_t schedule_time_us, bool shutdown);
+
+    void enqueueResultTask(ResultTask task);
+
+    void resultLoop();
+
+    void receiveAndProcessResult(const StreamGroups&             stream_groups,
+                                 int64_t                         schedule_time_us,
+                                 RtpLLMExecutorMetricsCollector& executor_collector);
+
+    /** Ask the first-stage root's result thread to exit after its queued tasks; does not join. */
+    void requestResultStop();
 
     void waitLastRun();
 
@@ -143,8 +157,6 @@ private:
     void advanceSamplingStates(const PPSamplingPlan& sampling_plan, PPExecutionResult& result);
 
     void eraseFailedDSparkQ(const PPExecutionResult& result);
-
-    absl::Status processExecutionResult(InflightBatch& batch);
 
     void verifyDraftTokens(const PPExecutionPlan&                        plan,
                            const torch::Tensor&                          target_logits,
@@ -176,9 +188,10 @@ private:
 
     void asyncSendExecutionResult(const PPExecutionResult& result, PPTickets& tickets);
 
-    void sendObject(const torch::Tensor& object, PPTickets& tickets);
+    void
+    asyncSendObject(const torch::Tensor& object, PPTickets& tickets, const std::string& group_name = kPPCpuGroupName);
 
-    torch::Tensor receiveObject();
+    torch::Tensor receiveObject(const std::string& group_name = kPPCpuGroupName);
 
     void waitAll(PPTickets& tickets);
 
@@ -205,7 +218,9 @@ private:
                             StreamGroups::TokenCountsByPriority&     token_counts_by_priority,
                             RtpLLMSpeculativeEngineMetricsCollector& sp_collector) const;
 
-    void reportResultMetrics(InflightBatch&                             batch,
+    void reportResultMetrics(const StreamGroups&                        stream_groups,
+                             int64_t                                    schedule_time_us,
+                             RtpLLMExecutorMetricsCollector&            executor_collector,
                              const StreamGroups::TokenCountsByPriority& token_counts_by_priority,
                              RtpLLMSpeculativeEngineMetricsCollector&   sp_collector);
 
@@ -230,7 +245,7 @@ private:
     /** Keep draft-vocabulary Q on the last-stage GPU, keyed by request to survive pipeline-slot reuse. */
     std::unordered_map<RequestId, torch::Tensor> dspark_q_;
 
-    /** A processed terminal plan prevents further execution while the engine waits for local stop(). */
+    /** The local execution loop has processed the terminal plan. */
     bool stopped_ = false;
 
     bool    sp_enabled_             = false;
@@ -254,6 +269,13 @@ private:
     std::unique_ptr<PPTransport> transport_;
     std::vector<InflightBatch>   slots_;
     size_t                       current_slot_ = 0;
+
+    std::mutex              result_mutex_;
+    std::condition_variable result_cv_;
+    std::deque<ResultTask>  result_tasks_;
+    bool                    result_processing_ = false;
+    bool                    result_stop_ = false;
+    std::thread             result_thread_;
 
     /** Covers the last execution's model-buffer consumers, including outgoing activation copies. */
     torch::Event last_compute_done_ = cuda_graph::makeGraphEvent();

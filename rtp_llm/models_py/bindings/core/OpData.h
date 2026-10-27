@@ -29,6 +29,8 @@ enum class ParallelMode {
     EPLB   = 5,
     /** Spans all TP/DP ranks in the current PP stage; aliases WORLD when pp_size is one. */
     STAGE = 6,
+    /** Spans PP stages with the same DP/TP coordinates. */
+    PP = 7,
 };
 
 // A batch includes two parts: context batch and decoder batch.

@@ -13,6 +13,7 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #if USING_ROCM
@@ -138,17 +139,9 @@ public:
     virtual bool isCompleted() = 0;
 };
 
-enum class P2PBackend {
-    NCCL = 0,
-    GLOO = 1,
-};
-
-/** Select a registered P2P group explicitly; send and receive must use the same backend. */
-std::unique_ptr<P2PWork> execISend(const torch::Tensor& tensor, int64_t global_peer, P2PBackend backend);
-std::unique_ptr<P2PWork> execIRecv(torch::Tensor& tensor, int64_t global_peer, P2PBackend backend);
-
-// Snapshot exchange over the PP process group; returns payloads in pp_rank order. Startup-only, pp_size > 1.
-std::vector<std::string> execPPSnapshotExchange(const std::string& local_snapshot);
+/** The group name identifies one ProcessGroup in the registered Python callbacks. */
+std::unique_ptr<P2PWork> execISend(const torch::Tensor& tensor, int64_t global_peer, const std::string& group_name);
+std::unique_ptr<P2PWork> execIRecv(torch::Tensor& tensor, int64_t global_peer, const std::string& group_name);
 
 // ===================================================================
 // MOE / EPLB

@@ -353,13 +353,15 @@ PPBatchStreamProcessor::prepareLogitsProcessorsAsync(const PPSamplingPlan& sampl
                             stream_count);
 
     std::vector<GrammarKeyCpp> keys;
-    keys.reserve(stream_count);
-    const auto* request_ids = sampling_plan.request_ids.data_ptr<int64_t>();
+    const auto*               request_ids = sampling_plan.request_ids.data_ptr<int64_t>();
     for (int64_t stream_idx = 0; stream_idx < stream_count; ++stream_idx) {
+        const auto& config = sampling_plan.logits_processor_configs[stream_idx];
+        if (config.grammar_type.empty()) {
+            continue;
+        }
         if (sampling_states.find(request_ids[stream_idx]) != sampling_states.end()) {
             continue;
         }
-        const auto& config = sampling_plan.logits_processor_configs[stream_idx];
         if (isSupportedGrammarType(config.grammar_type)) {
             keys.push_back({config.grammar_type, config.grammar_value});
         }
@@ -1060,16 +1062,16 @@ torch::Tensor PPBatchStreamProcessor::prepareDSparkDraftTemperature(const PPSamp
     return draft_temperature.to(device, /*non_blocking=*/true);
 }
 
-absl::Status PPBatchStreamProcessor::dispatchExecutionResult(const StreamGroups&      stream_groups,
-                                                             const PPExecutionResult& result) const {
+void PPBatchStreamProcessor::dispatchExecutionResult(const StreamGroups&      stream_groups,
+                                                     const PPExecutionResult& result) const {
     validateExecutionResult(stream_groups, result);
     if (stream_groups.allStreams().front()->generateConfig()->isPrefillOnly()) {
-        return dispatchPrefillOnlyExecutionResult(stream_groups, result);
+        dispatchPrefillOnlyExecutionResult(stream_groups, result);
+    } else if (sp_enabled_) {
+        dispatchSpeculativeExecutionResult(stream_groups, result);
+    } else {
+        dispatchNormalExecutionResult(stream_groups, result);
     }
-    if (sp_enabled_) {
-        return dispatchSpeculativeExecutionResult(stream_groups, result);
-    }
-    return dispatchNormalExecutionResult(stream_groups, result);
 }
 
 void PPBatchStreamProcessor::validateExecutionResult(const StreamGroups&      stream_groups,
@@ -1087,8 +1089,8 @@ void PPBatchStreamProcessor::validateExecutionResult(const StreamGroups&      st
                             "PP request error counts do not match the inflight stream count");
 }
 
-absl::Status PPBatchStreamProcessor::dispatchPrefillOnlyExecutionResult(const StreamGroups&      stream_groups,
-                                                                        const PPExecutionResult& result) const {
+void PPBatchStreamProcessor::dispatchPrefillOnlyExecutionResult(const StreamGroups&      stream_groups,
+                                                                const PPExecutionResult& result) const {
     int64_t row = 0;
     for (const auto& stream : stream_groups.allStreams()) {
         RTP_LLM_CHECK_WITH_INFO(stream->generateConfig()->isPrefillOnly() && stream->currentBatchSize() == 1
@@ -1103,11 +1105,10 @@ absl::Status PPBatchStreamProcessor::dispatchPrefillOnlyExecutionResult(const St
         stream->clearPPInflight();
         ++row;
     }
-    return absl::OkStatus();
 }
 
-absl::Status PPBatchStreamProcessor::dispatchSpeculativeExecutionResult(const StreamGroups&      stream_groups,
-                                                                        const PPExecutionResult& result) const {
+void PPBatchStreamProcessor::dispatchSpeculativeExecutionResult(const StreamGroups&      stream_groups,
+                                                                const PPExecutionResult& result) const {
     const auto all_streams = stream_groups.allStreams();
     const auto batch_size  = static_cast<int64_t>(all_streams.size());
     const bool is_prefill  = all_streams.empty() || all_streams.front()->isContextStream();
@@ -1188,11 +1189,10 @@ absl::Status PPBatchStreamProcessor::dispatchSpeculativeExecutionResult(const St
         stream->clearPPInflight();
         ++row;
     }
-    return absl::OkStatus();
 }
 
-absl::Status PPBatchStreamProcessor::dispatchNormalExecutionResult(const StreamGroups&      stream_groups,
-                                                                   const PPExecutionResult& result) const {
+void PPBatchStreamProcessor::dispatchNormalExecutionResult(const StreamGroups&      stream_groups,
+                                                           const PPExecutionResult& result) const {
     const auto all_streams = stream_groups.allStreams();
 
     const auto* request_ids = result.request_ids.data_ptr<RequestId>();
@@ -1207,7 +1207,6 @@ absl::Status PPBatchStreamProcessor::dispatchNormalExecutionResult(const StreamG
         ++stream_idx;
         batch_idx += stream_batch_size;
     }
-    return absl::OkStatus();
 }
 
 void PPBatchStreamProcessor::dispatchNormalSingleStream(const GenerateStreamPtr& stream,

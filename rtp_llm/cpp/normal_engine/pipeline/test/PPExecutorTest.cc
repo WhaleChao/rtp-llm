@@ -1,7 +1,7 @@
 /**
  * Single-stage PPExecutor tests, organized by ownership:
  *   Common: construction, warmup, communication waits and profiler boundaries.
- *   First: stream preparation, inflight slots, result consumption and batch metrics.
+ *   First: stream preparation, queued result processing and batch metrics.
  *   Middle: local target execution and activation handoff.
  *   Last: sampling state, request errors, target verification and draft execution.
  * Add PD, MTP/EAGLE, DSpARK and TP/CP cases beside the stage behavior they exercise.
@@ -18,18 +18,22 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
-#include <exception>
+#include <deque>
 #include <functional>
 #include <future>
 #include <list>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -419,21 +423,39 @@ private:
 class InMemoryPPTransport: public PPTransport {
 public:
     void enqueueObject(const torch::Tensor& payload) {
+        std::lock_guard<std::mutex> lock(receive_mutex_);
         received_tensors.push_back(torch::tensor({payload.numel()}, torch::kInt64));
         received_tensors.push_back(payload);
+        receive_cv_.notify_one();
     }
 
-    std::unique_ptr<PPCommTicket> asyncSend(const torch::Tensor& tensor) override {
+    std::unique_ptr<PPCommTicket> asyncSend(const torch::Tensor& tensor, const std::string& group_name) override {
         if (on_send) {
             on_send(tensor);
         }
         sent_tensors.push_back(tensor.clone());
-        return std::make_unique<PPCommTicket>(std::make_unique<InMemoryP2PWork>(tensor));
+        sent_groups.push_back(group_name);
+        return std::make_unique<PPCommTicket>(std::make_unique<InMemoryP2PWork>(tensor, on_send_wait));
     }
 
-    std::unique_ptr<PPCommTicket> asyncReceive(torch::Tensor& tensor) override {
+    std::unique_ptr<PPCommTicket> asyncReceive(torch::Tensor& tensor, const std::string& group_name) override {
         if (on_receive) {
             on_receive(tensor);
+        }
+        if (group_name == kPPResultGroupName) {
+            return std::make_unique<PPCommTicket>(
+                std::make_unique<InMemoryP2PWork>(tensor, [this](torch::Tensor target) {
+                    torch::Tensor source;
+                    {
+                        std::unique_lock<std::mutex> lock(receive_mutex_);
+                        receive_cv_.wait(lock, [this] { return receive_index.load() < received_tensors.size(); });
+                        source = received_tensors.at(receive_index++);
+                    }
+                    target.copy_(source);
+                    if (on_wait) {
+                        on_wait(target);
+                    }
+                }));
         }
         const auto& source = received_tensors.at(receive_index++);
         tensor.copy_(source, /*non_blocking=*/source.is_pinned());
@@ -442,10 +464,16 @@ public:
 
     std::vector<torch::Tensor>                received_tensors;
     std::vector<torch::Tensor>                sent_tensors;
-    size_t                                    receive_index = 0;
+    std::vector<std::string>                  sent_groups;
+    std::atomic<size_t>                       receive_index{0};
     std::function<void(const torch::Tensor&)> on_receive;
     std::function<void(const torch::Tensor&)> on_send;
+    std::function<void(const torch::Tensor&)> on_send_wait;
     std::function<void(const torch::Tensor&)> on_wait;
+
+private:
+    std::mutex              receive_mutex_;
+    std::condition_variable receive_cv_;
 };
 
 /** Replay root broadcasts through the real TP input packing and non-root unpacking paths. */
@@ -459,6 +487,9 @@ public:
             py::cpp_function([this](const std::vector<torch::Tensor>& tensors, int64_t root, int mode) {
                 EXPECT_EQ(root, 0);
                 EXPECT_EQ(mode, static_cast<int>(ParallelMode::TP));
+                if (on_broadcast) {
+                    on_broadcast();
+                }
                 if (!replay_) {
                     std::vector<torch::Tensor> buffers;
                     for (const auto& tensor : tensors) {
@@ -484,6 +515,8 @@ public:
                 const bool local_ok = status.item<int32_t>() != 0;
                 return torch::full_like(status, reduce_status ? reduce_status(local_ok) : local_ok);
             }),
+            unused,
+            unused,
             unused);
     }
 
@@ -505,6 +538,7 @@ public:
     }
 
     std::function<bool(bool)> reduce_status;
+    std::function<void()>     on_broadcast;
 
 private:
     py::module_                             ops_;
@@ -652,6 +686,29 @@ protected:
         auto* wire          = transport.get();
         executor.transport_ = std::move(transport);
         return wire;
+    }
+
+    /** Receiver teardown waits for pending work; supply a tail result in tests focused on inputs or forward. */
+    static void completeFirstStage(PPExecutor& executor, InMemoryPPTransport& wire) {
+        if (executor.warm_up_ || !executor.isFirstStage() || !executor.isStageRoot()) {
+            return;
+        }
+        PPExecutionResult result;
+        {
+            std::lock_guard<std::mutex> lock(executor.result_mutex_);
+            if (!executor.result_processing_ && executor.result_tasks_.empty()) {
+                return;
+            }
+        }
+        const auto& plan_payload = wire.sent_tensors.at(1);
+        const auto  plan         = pp_serialization::deserializePlan(plan_payload);
+        result.request_ids       = plan.sampling_plan.request_ids;
+        const auto count         = result.request_ids.numel();
+        result.new_token_lengths = torch::zeros({count}, torch::kInt32);
+        result.request_outputs.resize(count);
+        result.request_errors.assign(count, ErrorInfo(ErrorCode::UNKNOWN_ERROR, "test tail completion"));
+        wire.enqueueObject(pp_serialization::serializeExecutionResult(result));
+        executor.drainPendingResults();
     }
 
     static PPIntermediateTensors activations(int64_t rows) {
@@ -1118,7 +1175,7 @@ TEST_F(PPExecutorTest, CommonProfileStartsBeforeActivationReceiveAndSkipsEmptyEx
     int  finishes                = 0;
     executor.profile_step_start_ = [&] {
         EXPECT_FALSE(profiling);
-        EXPECT_EQ(wire->receive_index, 2u);
+        EXPECT_EQ(wire->receive_index.load(), 2u);
         profiling = true;
         ++starts;
     };
@@ -1136,7 +1193,7 @@ TEST_F(PPExecutorTest, CommonProfileStartsBeforeActivationReceiveAndSkipsEmptyEx
     ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
     EXPECT_EQ(starts, 1);
     EXPECT_EQ(finishes, 1);
-    EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
+    EXPECT_EQ(wire->receive_index.load(), wire->received_tensors.size());
 }
 
 TEST_F(PPExecutorTest, CommonWarmupUsesLocalStageInputsWithoutPipelineTraffic) {
@@ -1162,14 +1219,14 @@ TEST_F(PPExecutorTest, CommonWarmupUsesLocalStageInputsWithoutPipelineTraffic) {
             EXPECT_TRUE(torch::equal(recorded->received_hidden[0], torch::full_like(recorded->received_hidden[0], 7)));
         }
         EXPECT_TRUE(wire->sent_tensors.empty());
-        EXPECT_EQ(wire->receive_index, 0u);
+        EXPECT_EQ(wire->receive_index.load(), 0u);
         EXPECT_TRUE(executor.sampling_states_.empty());
         EXPECT_EQ(starts, 0);
         EXPECT_EQ(finishes, 0);
     }
 }
 
-TEST_F(PPExecutorTest, CommonSlotReuseWaitsForPreviousSendsBeforeForward) {
+TEST_F(PPExecutorTest, CommonPlanForwardingPrecedesSlotReuse) {
     for (int stage : {0, 1, 2}) {
         SCOPED_TRACE(stage);
         auto       params = makeStageParams(stage);
@@ -1192,13 +1249,24 @@ TEST_F(PPExecutorTest, CommonSlotReuseWaitsForPreviousSendsBeforeForward) {
             add_work(slot.activation_sends, previous_payload);
             add_work(other_slot.activation_sends, other_slot_payload);
         }
-        /** Reusing one slot must leave another batch's unfinished sends owned and unwaited. */
+        int new_send_waits = 0;
+        wire->on_send_wait = [&](const torch::Tensor&) { ++new_send_waits; };
+        wire->on_send      = [&](const torch::Tensor&) {
+            if (stage != 2 && wire->sent_tensors.size() < 2) {
+                EXPECT_EQ(previous_plan->waits, 0);
+                EXPECT_EQ(previous_payload->waits, 0);
+                EXPECT_EQ(slot.plan_sends.size(), 1u);
+            }
+        };
+        /** Other slots retain their pending sends. */
         auto* model       = installModel<RecordingStageModel>(executor, params.parallelism_config);
         model->on_forward = [&] {
             EXPECT_EQ(previous_plan->waits, stage == 2 ? 0 : 1);
             EXPECT_EQ(previous_payload->waits, 1);
             EXPECT_EQ(other_slot_payload->waits, 0);
             EXPECT_EQ(other_slot_payload->destroyed, 0);
+            EXPECT_EQ(new_send_waits, 0);
+            EXPECT_EQ(slot.plan_sends.size(), stage == 2 ? 0u : 2u);
         };
         ScheduleOutput schedule;
         if (stage == 0) {
@@ -1207,14 +1275,15 @@ TEST_F(PPExecutorTest, CommonSlotReuseWaitsForPreviousSendsBeforeForward) {
             enqueuePlan(*wire, makePlan(params));
         }
         ASSERT_TRUE(executor.process(schedule).ok());
-        EXPECT_EQ(previous_payload->waits, 1);
-        EXPECT_EQ(other_slot_payload->waits, 0);
-        EXPECT_EQ(other_slot_payload->destroyed, 0);
-        /** New sends belong to the current execution, not to the completed work. */
+        ASSERT_EQ(model->inputs.size(), 1u);
+        EXPECT_EQ(new_send_waits, 0);
+        /** Draining the slot waits on the current plan. */
         executor.waitAll(slot.plan_sends);
+        EXPECT_EQ(new_send_waits, stage == 2 ? 0 : 2);
         executor.waitAll(slot.activation_sends);
         executor.waitAll(slot.execution_result_sends);
         EXPECT_EQ(previous_payload->waits, 1);
+        completeFirstStage(executor, *wire);
     }
 }
 
@@ -1234,7 +1303,6 @@ TEST_F(PPExecutorTest, CommonActivationSendsReapedAcrossSlotsIncludingSkippedBat
         std::vector<std::shared_ptr<WorkState>> completed;
         for (size_t slot = 1; slot < executor.slots_.size(); ++slot) {
             auto& batch = executor.slots_[slot];
-            ASSERT_FALSE(batch.result_pending);
             metadata.push_back(std::make_shared<WorkState>());
             pending.push_back(std::make_shared<WorkState>());
             completed.push_back(std::make_shared<WorkState>());
@@ -1396,7 +1464,7 @@ TEST_F(PPExecutorTest, CommonActivationReceivesReuseTwoBuffersAcrossForwardsAndS
             EXPECT_EQ(received.back().storage().nbytes(), received[(executions - 1) % 2].storage().nbytes());
         }
     }
-    EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
+    EXPECT_EQ(wire->receive_index.load(), wire->received_tensors.size());
 }
 
 TEST_F(PPExecutorTest, FinishWaitsForEarlierSendsAndPropagatesFailures) {
@@ -1429,7 +1497,7 @@ TEST_F(PPExecutorTest, FinishWaitsForEarlierSendsAndPropagatesFailures) {
                 EXPECT_EQ(state->waits, 0);
             }
             const auto sends    = wire->sent_tensors.size();
-            const auto receives = wire->receive_index;
+            const auto receives = wire->receive_index.load();
             if (fail) {
                 EXPECT_THROW((void)executor.finish(), std::runtime_error);
             } else {
@@ -1441,7 +1509,7 @@ TEST_F(PPExecutorTest, FinishWaitsForEarlierSendsAndPropagatesFailures) {
             }
             EXPECT_TRUE(recorded->inputs.empty());
             EXPECT_EQ(wire->sent_tensors.size(), sends);
-            EXPECT_EQ(wire->receive_index, receives);
+            EXPECT_EQ(wire->receive_index.load(), receives);
         }
     }
 }
@@ -1491,7 +1559,7 @@ TEST_F(PPExecutorTest, FirstSendsHistoryDeltasAndRetiresCursorBeforeRequestIdReu
     EXPECT_EQ(executor.token_history_lengths_.at(101), 2);
     const auto first = pp_serialization::deserializePlan(wire->sent_tensors.at(1));
     EXPECT_EQ(tensorToVector<int32_t>(first.sampling_plan.token_ids), (std::vector<int32_t>{1, 2}));
-    ASSERT_TRUE(executor.drainPendingResults().ok());
+    executor.drainPendingResults();
     EXPECT_EQ(stream->seqLength(), 3);
     EXPECT_EQ(executor.token_history_lengths_.at(101), 2);
 
@@ -1503,7 +1571,7 @@ TEST_F(PPExecutorTest, FirstSendsHistoryDeltasAndRetiresCursorBeforeRequestIdReu
     EXPECT_EQ(tensorToVector<int32_t>(delta.sampling_plan.token_ids), (std::vector<int32_t>{7}));
     EXPECT_EQ(tensorToVector<int64_t>(delta.sampling_plan.token_offsets), (std::vector<int64_t>{0, 1}));
     EXPECT_EQ(executor.token_history_lengths_.at(101), 3);
-    ASSERT_TRUE(executor.drainPendingResults().ok());
+    executor.drainPendingResults();
 
     ScheduleOutput cleanup;
     cleanup.finished_request_ids = {101};
@@ -1548,75 +1616,58 @@ TEST_F(PPExecutorTest, FirstExecutesPrefillAndDecodeWithoutUpstreamActivations) 
                   decode ? (std::vector<int32_t>{1, 2, 7}) : (std::vector<int32_t>{1, 2}));
         EXPECT_EQ(executor.token_history_lengths_.at(101), stream->seqLength());
         EXPECT_TRUE(torch::equal(wire->sent_tensors.back(), recorded->hidden_buffer.narrow(1, 0, 2)));
-        EXPECT_EQ(wire->receive_index, 0u);
+        EXPECT_EQ(wire->receive_index.load(), 0u);
         EXPECT_TRUE(stream->isPPInflight());
         EXPECT_TRUE(executor.sampling_states_.empty());
+        completeFirstStage(executor, *wire);
     }
 }
 
-TEST_F(PPExecutorTest, FirstEmptyPlansDrainEachBatchOnceAcrossSlotWraparound) {
+TEST_F(PPExecutorTest, FirstQueuedResultsOwnTheirArgumentsAcrossSlotWraparound) {
     for (int pp_size : {2, 3, 4}) {
-        for (int batches : {1, 7}) {
-            SCOPED_TRACE(testing::Message() << "pp_size=" << pp_size << ", batches=" << batches);
-            auto params                          = makeStageParams(0);
-            params.model_config_.num_layers      = pp_size;
-            params.parallelism_config.pp_size    = pp_size;
-            params.parallelism_config.world_size = pp_size;
-            params.parallelism_config.pp_stage_layer_counts.assign(pp_size, 1);
-            PPExecutor executor(params, nullptr, false);
-            enableMetrics(executor);
-            auto*                          wire     = attachTransport(executor);
-            auto*                          recorded = installModel<RecordingDraftModel>(executor);
-            std::vector<GenerateStreamPtr> streams;
-            for (int index = 0; index < batches; ++index) {
-                auto stream = makeStream(ResourceContext{}, params.model_config_, 101 + index, {1, 2}, 1);
-                streams.push_back(stream);
-                const auto result = makeSingleTokenResult(101 + index, 20 + index);
-                wire->enqueueObject(pp_serialization::serializeExecutionResult(result));
-            }
-            const auto start = autil::TimeUtility::currentTimeInMicroSeconds();
-            /** After the real batches, ordinary empty plans alone must drain results, including a single request. */
-            for (int round = 0; round < batches + pp_size; ++round) {
-                SCOPED_TRACE(round);
-                ScheduleOutput schedule;
-                if (round < batches) {
-                    streams[round]->setPPInflight();
-                    schedule.streams = {streams[round]};
-                }
-                const auto slot  = executor.current_slot_;
-                const auto sends = wire->sent_tensors.size();
-                ASSERT_TRUE(executor.process(schedule, start + round).ok());
-                EXPECT_EQ(executor.current_slot_, (slot + 1) % executor.slots_.size());
-                const auto& admitted = executor.slots_[slot];
-                EXPECT_EQ(admitted.schedule_time_us, start + round);
-                if (round >= batches) {
-                    ASSERT_EQ(wire->sent_tensors.size(), sends + 2);
-                    const auto empty_plan = pp_serialization::deserializePlan(wire->sent_tensors[sends + 1]);
-                    EXPECT_TRUE(empty_plan.model_input.skip_run);
-                    EXPECT_FALSE(empty_plan.model_input.is_fake_stream);
-                    EXPECT_FALSE(empty_plan.model_input.shutdown);
-                    EXPECT_TRUE(empty_plan.finished_request_ids.empty());
-                    EXPECT_FALSE(admitted.result_pending);
-                }
-                EXPECT_EQ(recorded->inputs.size(), std::min(round + 1, batches));
-                const int returned = std::clamp(round - pp_size + 1, 0, batches);
-                const int pending  = std::min(round + 1, batches) - returned;
-                EXPECT_EQ(executor.tps_reporter_.active_count_, pending);
-                EXPECT_EQ(executor.wall_tps_reporter_.active_count_, pending);
-                EXPECT_EQ(wire->receive_index, 2u * returned);
-                for (int index = 0; index < std::min(round + 1, batches); ++index) {
-                    EXPECT_EQ(streams[index]->isPPInflight(), index >= returned);
-                    EXPECT_EQ(streams[index]->seqLength(), index < returned ? 3 : 2);
-                    if (index < returned) {
-                        EXPECT_EQ(streams[index]->completeTokenIdsVec(0).back(), 20 + index);
-                    }
-                }
-            }
-            EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
-            for (const auto& batch : executor.slots_) {
-                EXPECT_FALSE(batch.result_pending);
-            }
+        SCOPED_TRACE(pp_size);
+        auto params                          = makeStageParams(0);
+        params.model_config_.num_layers      = pp_size;
+        params.parallelism_config.pp_size    = pp_size;
+        params.parallelism_config.world_size = pp_size;
+        params.parallelism_config.pp_stage_layer_counts.assign(pp_size, 1);
+        PPExecutor                     executor(params, nullptr, false);
+        auto*                          wire  = attachTransport(executor);
+        auto*                          model = installModel<RecordingDraftModel>(executor);
+        std::vector<GenerateStreamPtr> streams;
+        std::vector<torch::Tensor>     payloads;
+        const int                      batches = 3 * (pp_size + 1);
+        for (int index = 0; index < batches; ++index) {
+            auto stream = makeStream(ResourceContext{}, params.model_config_, 101 + index, {1, 2}, 1);
+            stream->setPPInflight();
+            streams.push_back(stream);
+            auto result                      = makeSingleTokenResult(101 + index, 20 + index);
+            result.request_outputs[0].logits = torch::ones({1, index + 1});
+            payloads.push_back(pp_serialization::serializeExecutionResult(result));
+            ASSERT_TRUE(executor.process(ScheduleOutput{{stream}}).ok());
         }
+        for (int index = 0; index < pp_size + 1; ++index) {
+            ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+        }
+        /** Withheld replies expose any dependence of slot reuse on result reception. */
+        EXPECT_EQ(model->inputs.size(), batches);
+        EXPECT_EQ(wire->receive_index.load(), 0u);
+        for (const auto& stream : streams) {
+            EXPECT_TRUE(stream->isPPInflight());
+            EXPECT_EQ(stream->seqLength(), 2);
+        }
+        for (const auto& payload : payloads) {
+            wire->enqueueObject(payload);
+        }
+        executor.drainPendingResults();
+        EXPECT_EQ(wire->receive_index.load(), 2u * batches);
+        for (int index = 0; index < batches; ++index) {
+            EXPECT_FALSE(streams[index]->isPPInflight());
+            EXPECT_EQ(streams[index]->completeTokenIdsVec(0), (std::vector<int>{1, 2, 20 + index}));
+        }
+        ASSERT_TRUE(executor.finish().ok());
+        EXPECT_FALSE(executor.result_thread_.joinable());
+        expectSlotsDrained(executor);
     }
 }
 
@@ -1632,10 +1683,8 @@ TEST_F(PPExecutorTest, FirstCancelledAndTimedOutBatchesStillConsumeTheirResult) 
         ASSERT_TRUE(executor.process(ScheduleOutput{{stream}}).ok());
         stream->reportError(code, "ended while in flight");
         wire->enqueueObject(pp_serialization::serializeExecutionResult(makeSingleTokenResult(101, 20)));
-        for (int round = 0; round < params.parallelism_config.pp_size; ++round) {
-            ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
-        }
-        EXPECT_EQ(wire->receive_index, 2u);
+        executor.drainPendingResults();
+        EXPECT_EQ(wire->receive_index.load(), 2u);
         EXPECT_FALSE(stream->isPPInflight());
         EXPECT_EQ(stream->statusInfo().code(), code);
         EXPECT_EQ(stream->seqLength(), 2);
@@ -1663,6 +1712,7 @@ TEST_F(PPExecutorTest, FirstShutdownDrainsOnlyPreviouslySubmittedBatches) {
                 auto*      recorded = installModel<RecordingStageModel>(executor, params.parallelism_config);
                 std::vector<GenerateStreamPtr> streams;
                 std::vector<int32_t>           expected_tokens;
+                std::vector<torch::Tensor>     pending_results;
                 for (int round = 0; round < rounds; ++round) {
                     ScheduleOutput schedule;
                     const bool     empty = pattern == 1 && round % 4 == 1;
@@ -1680,7 +1730,7 @@ TEST_F(PPExecutorTest, FirstShutdownDrainsOnlyPreviouslySubmittedBatches) {
                             expected_tokens.push_back(20 + round);
                             result = makeSingleTokenResult(101 + round, 20 + round);
                         }
-                        wire->enqueueObject(pp_serialization::serializeExecutionResult(result));
+                        pending_results.push_back(pp_serialization::serializeExecutionResult(result));
                     }
                     ASSERT_TRUE(executor.process(schedule).ok());
                     EXPECT_FALSE(executor.stopped_);
@@ -1695,18 +1745,18 @@ TEST_F(PPExecutorTest, FirstShutdownDrainsOnlyPreviouslySubmittedBatches) {
                 const auto sends    = wire->sent_tensors.size();
                 const auto forwards = recorded->inputs.size();
                 const auto slot     = executor.current_slot_;
-                wire->on_receive    = [&](const torch::Tensor&) {
-                    /** Downstream ranks must receive the terminal plan before the root drains their results. */
-                    ASSERT_EQ(wire->sent_tensors.size(), sends + 2);
-                    const auto terminal = pp_serialization::deserializePlan(wire->sent_tensors[sends + 1]);
-                    EXPECT_TRUE(terminal.model_input.shutdown);
-                    EXPECT_TRUE(terminal.model_input.skip_run);
+                /** Withhold replies until shutdown starts to verify that finish() drains pending results. */
+                wire->on_send = [&](const torch::Tensor&) {
+                    for (const auto& payload : pending_results) {
+                        wire->enqueueObject(payload);
+                    }
+                    pending_results.clear();
                 };
                 ASSERT_TRUE(executor.finish().ok());
                 EXPECT_TRUE(executor.token_history_lengths_.empty());
                 EXPECT_TRUE(executor.stopped_);
-                /** No terminal result is queued: extra or duplicate receives fail the transport. */
-                EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
+                /** The terminal plan produces no result; only previously submitted batches are received. */
+                EXPECT_EQ(wire->receive_index.load(), wire->received_tensors.size());
                 ASSERT_EQ(wire->sent_tensors.size(), sends + 2);
                 const auto terminal = pp_serialization::deserializePlan(wire->sent_tensors[sends + 1]);
                 EXPECT_TRUE(terminal.model_input.shutdown);
@@ -1718,7 +1768,7 @@ TEST_F(PPExecutorTest, FirstShutdownDrainsOnlyPreviouslySubmittedBatches) {
                 ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
                 EXPECT_EQ(executor.current_slot_, stopped_slot);
                 EXPECT_EQ(wire->sent_tensors.size(), sends + 2);
-                EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
+                EXPECT_EQ(wire->receive_index.load(), wire->received_tensors.size());
                 for (size_t i = 0; i < streams.size(); ++i) {
                     EXPECT_FALSE(streams[i]->isPPInflight());
                     if (streams[i]->statusInfo().code() == ErrorCode::CANCELLED) {
@@ -1734,7 +1784,7 @@ TEST_F(PPExecutorTest, FirstShutdownDrainsOnlyPreviouslySubmittedBatches) {
     }
 }
 
-TEST_F(PPExecutorTest, FirstExplicitDrainPreservesOrderAcrossWrapsAndServingOverlap) {
+TEST_F(PPExecutorTest, FirstExplicitDrainPreservesOrderAcrossWrapsAndAllowsFurtherSubmissions) {
     for (int pp_size : {2, 3, 4}) {
         SCOPED_TRACE(pp_size);
         auto params                          = makeStageParams(0);
@@ -1775,16 +1825,13 @@ TEST_F(PPExecutorTest, FirstExplicitDrainPreservesOrderAcrossWrapsAndServingOver
             const auto slot  = executor.current_slot_;
             ASSERT_TRUE(executor.process(schedule).ok());
             if (synchronous) {
-                ASSERT_TRUE(executor.drainPendingResults().ok());
+                executor.drainPendingResults();
             }
             /** Waiting never submits pump plans or advances the ring beyond the single submitted plan. */
             EXPECT_EQ(wire->sent_tensors.size() - sends, kind == 0 ? 2u : 5u);
             EXPECT_EQ(executor.current_slot_, (slot + 1) % executor.slots_.size());
             if (synchronous) {
-                EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
-                for (const auto& batch : executor.slots_) {
-                    EXPECT_FALSE(batch.result_pending);
-                }
+                EXPECT_EQ(wire->receive_index.load(), wire->received_tensors.size());
                 /** Waiting for results does not retire the new slot's asynchronous sends. */
                 EXPECT_FALSE(executor.slots_[slot].plan_sends.empty());
                 for (const auto& stream : streams) {
@@ -1798,48 +1845,17 @@ TEST_F(PPExecutorTest, FirstExplicitDrainPreservesOrderAcrossWrapsAndServingOver
             submit(round, round % 3, round % (pp_size + 1) == pp_size - 1);
         }
         submit(rounds, 2, true);
-        /** After explicitly draining pending results, normal serving must still retain its pipeline overlap. */
-        const auto receives = wire->receive_index;
+        /** Draining leaves the result thread running to handle subsequent batches. */
         for (int round = 0; round < pp_size; ++round) {
             submit(rounds + 1 + round, 2, false);
-            EXPECT_TRUE(streams.back()->isPPInflight());
-            EXPECT_EQ(wire->receive_index, receives);
         }
         ASSERT_TRUE(executor.finish().ok());
-        EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
-        for (const auto& batch : executor.slots_) {
-            EXPECT_FALSE(batch.result_pending);
-        }
+        EXPECT_EQ(wire->receive_index.load(), wire->received_tensors.size());
         for (size_t i = 0; i < streams.size(); ++i) {
             EXPECT_FALSE(streams[i]->isPPInflight());
             EXPECT_EQ(streams[i]->completeTokenIdsVec(0), (std::vector<int>{1, 2, expected_tokens[i]}));
         }
     }
-}
-
-TEST_F(PPExecutorTest, FirstConsumedInvalidResultIsNotReceivedAgain) {
-    auto       params = makeStageParams(0);
-    PPExecutor executor(params, nullptr, false);
-    enableMetrics(executor);
-    auto* wire                  = attachTransport(executor);
-    auto  stream                = makeStream(ResourceContext{}, params.model_config_, 101, {1, 2}, 1);
-    auto& batch                 = executor.slots_[0];
-    batch.result_pending        = true;
-    batch.stream_groups         = StreamGroups({stream});
-    batch.tps_active_guard      = executor.tps_reporter_.makeActiveGuard();
-    batch.wall_tps_active_guard = executor.wall_tps_reporter_.makeActiveGuard();
-    ASSERT_EQ(executor.tps_reporter_.active_count_, 1);
-    ASSERT_EQ(executor.wall_tps_reporter_.active_count_, 1);
-    stream.reset();
-    /** A deserialized but invalid result has already consumed its wire message. */
-    wire->enqueueObject(pp_serialization::serializeExecutionResult(PPExecutionResult{}));
-    EXPECT_THROW((void)executor.drainPendingResults(), std::exception);
-    EXPECT_FALSE(batch.result_pending);
-    EXPECT_EQ(executor.tps_reporter_.active_count_, 0);
-    EXPECT_EQ(executor.wall_tps_reporter_.active_count_, 0);
-    EXPECT_EQ(wire->receive_index, 2u);
-    EXPECT_TRUE(executor.drainPendingResults().ok());
-    EXPECT_EQ(wire->receive_index, 2u);
 }
 
 TEST_F(PPExecutorTest, DownstreamFinishProcessesOutstandingPlansUntilShutdown) {
@@ -1860,7 +1876,7 @@ TEST_F(PPExecutorTest, DownstreamFinishProcessesOutstandingPlansUntilShutdown) {
         ASSERT_TRUE(executor.finish().ok());
         EXPECT_TRUE(executor.stopped_);
         EXPECT_EQ(recorded->inputs.size(), 1u);
-        EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
+        EXPECT_EQ(wire->receive_index.load(), wire->received_tensors.size());
         EXPECT_TRUE(executor.sampling_states_.empty());
         if (stage == 1) {
             ASSERT_EQ(wire->sent_tensors.size(), 9u);
@@ -1880,59 +1896,61 @@ TEST_F(PPExecutorTest, DownstreamFinishProcessesOutstandingPlansUntilShutdown) {
         EXPECT_EQ(executor.current_slot_, slot);
         EXPECT_EQ(recorded->inputs.size(), 1u);
         EXPECT_EQ(wire->sent_tensors.size(), sends);
-        EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
+        EXPECT_EQ(wire->receive_index.load(), wire->received_tensors.size());
     }
 }
 
-TEST_F(PPExecutorTest, FirstEmptyExecutionStillDispatchesThePreviousBatchOutsideProfile) {
-    for (bool skip_run : {false, true}) {
-        SCOPED_TRACE(skip_run);
-        auto params           = makeMtpParams(3);
-        params.sp_config.type = SP_TYPE_NONE;
-        PPExecutor executor(params, nullptr, false);
-        auto       current  = makeStream(ResourceContext{}, params.model_config_, 101, {1, 2}, 0);
-        auto       previous = makeStream(ResourceContext{}, params.model_config_, 202, {3, 4}, 0);
-        previous->setPPInflight();
-        executor.slots_[1].result_pending = true;
-        executor.slots_[1].stream_groups  = StreamGroups({previous});
-
-        const auto payload   = pp_serialization::serializeExecutionResult(makeSingleTokenResult(202, 17));
-        auto       transport = std::make_unique<InMemoryPPTransport>();
-        auto*      wire      = transport.get();
-        wire->enqueueObject(payload);
-        executor.transport_ = std::move(transport);
-
-        bool profiling               = false;
-        bool finished                = false;
-        executor.profile_step_start_ = [&]() {
-            EXPECT_FALSE(skip_run);
-            EXPECT_EQ(wire->receive_index, 0u);
-            EXPECT_TRUE(previous->isPPInflight());
-            profiling = true;
-        };
-        executor.profile_step_finish_ = [&]() {
-            EXPECT_FALSE(skip_run);
-            EXPECT_TRUE(profiling);
-            EXPECT_EQ(wire->receive_index, 0u);
-            EXPECT_TRUE(previous->isPPInflight());
-            profiling = false;
-            finished  = true;
-        };
-        auto target        = std::make_unique<RecordingDraftModel>();
-        target->on_forward = [&]() { EXPECT_TRUE(profiling); };
-        executor.setModel(std::move(target));
-
-        ScheduleOutput scheduled;
-        if (!skip_run) {
-            scheduled.streams = {current};
+TEST_F(PPExecutorTest, FirstResultReceiveRunsOnBackgroundAfterProfileFinish) {
+    auto       params = makeStageParams(0);
+    PPExecutor executor(params, nullptr, false);
+    auto*      wire = attachTransport(executor);
+    installModel<RecordingDraftModel>(executor);
+    auto stream = makeStream(ResourceContext{}, params.model_config_, 101, {1, 2}, 1);
+    stream->setPPInflight();
+    const auto         main_thread = std::this_thread::get_id();
+    std::atomic<bool>  profile_finished{false};
+    std::promise<void> receiving;
+    auto               receive_started = receiving.get_future();
+    std::atomic<bool>  first_receive{true};
+    executor.profile_step_finish_ = [&] { profile_finished.store(true); };
+    wire->on_receive              = [&](const torch::Tensor&) {
+        EXPECT_NE(std::this_thread::get_id(), main_thread);
+        EXPECT_TRUE(profile_finished.load());
+        if (first_receive.exchange(false)) {
+            receiving.set_value();
         }
-        ASSERT_TRUE(executor.process(scheduled).ok());
-        EXPECT_EQ(finished, !skip_run);
-        EXPECT_FALSE(profiling);
-        EXPECT_EQ(wire->receive_index, 2u);
-        EXPECT_FALSE(previous->isPPInflight());
-        EXPECT_EQ(previous->completeTokenIdsVec(0), (std::vector<int>{3, 4, 17}));
-    }
+    };
+    ASSERT_TRUE(executor.process(ScheduleOutput{{stream}}).ok());
+    const auto started = receive_started.wait_for(std::chrono::seconds(10));
+    EXPECT_EQ(started, std::future_status::ready);
+    EXPECT_TRUE(stream->isPPInflight());
+    /** The receiver is blocked without a length. Empty foreground steps still run. */
+    EXPECT_TRUE(executor.process(ScheduleOutput{}).ok());
+    auto drained = std::async(std::launch::async, [&] { executor.drainPendingResults(); });
+    EXPECT_EQ(drained.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    wire->enqueueObject(pp_serialization::serializeExecutionResult(makeSingleTokenResult(101, 17)));
+    drained.get();
+    EXPECT_FALSE(stream->isPPInflight());
+    EXPECT_EQ(stream->completeTokenIdsVec(0), (std::vector<int>{1, 2, 17}));
+    EXPECT_EQ(wire->receive_index.load(), 2u);
+    EXPECT_TRUE(std::all_of(wire->sent_groups.begin(), wire->sent_groups.end(), [](const std::string& name) {
+        return name == kPPDeviceGroupName || name == kPPCpuGroupName;
+    }));
+}
+
+TEST_F(PPExecutorTest, FirstQueuedTaskKeepsStreamAliveUntilProcessingCompletes) {
+    auto       params = makeStageParams(0);
+    PPExecutor executor(params, nullptr, false);
+    auto*      wire = attachTransport(executor);
+    installModel<RecordingDraftModel>(executor);
+    auto                          stream      = makeStream(ResourceContext{}, params.model_config_, 101, {1, 2}, 1);
+    std::weak_ptr<GenerateStream> weak_stream = stream;
+    EXPECT_TRUE(executor.process(ScheduleOutput{{stream}}).ok());
+    stream.reset();
+    EXPECT_FALSE(weak_stream.expired());
+    wire->enqueueObject(pp_serialization::serializeExecutionResult(makeSingleTokenResult(101, 17)));
+    executor.drainPendingResults();
+    EXPECT_TRUE(weak_stream.expired());
 }
 
 /** First: PD handoff, request validation and TP ownership. */
@@ -1947,7 +1965,7 @@ TEST_F(PPExecutorTest, FirstPdDecodeUsesPreparedCandidatesWithoutOverwritingThem
             std::make_shared<KVCacheManager>(test::makeSimpleMhaCacheConfig(3, 16, 4, DataType::TYPE_FP16));
         ASSERT_TRUE(resources.cache_manager->init());
         PPExecutor executor(params, resources.cache_manager, false);
-        attachTransport(executor);
+        auto*      wire     = attachTransport(executor);
         auto* recorded = installModel<RecordingDraftModel>(executor);
         auto  stream   = makeStream(resources, params.model_config_, 101, {1, 2}, 1);
         stream->fakeInitKVBlock(4);
@@ -1967,6 +1985,7 @@ TEST_F(PPExecutorTest, FirstPdDecodeUsesPreparedCandidatesWithoutOverwritingThem
         EXPECT_EQ(stream->getSPOutputBuffer(), buffer);
         EXPECT_TRUE(torch::equal(buffer->tokens, before));
         EXPECT_EQ(stream->completeTokenIdsVec(0), (std::vector<int>{1, 2, 7}));
+        completeFirstStage(executor, *wire);
     }
 }
 
@@ -2007,6 +2026,7 @@ TEST_F(PPExecutorTest, FirstAdmissionRejectsBeamSearchBeforeForward) {
         ASSERT_EQ(recorded->inputs.size(), 1u);
         const auto plan = pp_serialization::deserializePlan(wire->sent_tensors.at(1));
         EXPECT_EQ(tensorToVector<int64_t>(plan.sampling_plan.request_ids), std::vector<int64_t>{303});
+        completeFirstStage(executor, *wire);
     }
 }
 
@@ -2047,6 +2067,7 @@ TEST_F(PPExecutorTest, FirstAdmissionRejectsLossWithoutDiscardingHealthyRequests
         const auto plan = pp_serialization::deserializePlan(wire->sent_tensors.at(1));
         EXPECT_EQ(tensorToVector<int64_t>(plan.sampling_plan.request_ids), std::vector<int64_t>{202});
         EXPECT_FALSE(plan.output_config.calculate_loss);
+        completeFirstStage(executor, *wire);
     }
 }
 
@@ -2085,10 +2106,10 @@ TEST_F(PPExecutorTest, FirstAdmissionAllowsOptionalOutputsOnlyWithoutSpeculation
                 EXPECT_FALSE(stream->getSPOutputBuffer());
                 EXPECT_TRUE(plan.model_input.skip_run);
                 EXPECT_TRUE(recorded->inputs.empty());
-                EXPECT_FALSE(executor.slots_[0].result_pending);
-                ASSERT_TRUE(executor.drainPendingResults().ok());
-                EXPECT_EQ(wire->receive_index, 0u);
+                executor.drainPendingResults();
+                EXPECT_EQ(wire->receive_index.load(), 0u);
             }
+            completeFirstStage(executor, *wire);
         }
     }
 }
@@ -2122,6 +2143,7 @@ TEST_F(PPExecutorTest, FirstAdmissionRejectsTiledSamplingWithSpeculation) {
             EXPECT_FALSE(plan.model_input.skip_run);
             EXPECT_EQ(plan.sampling_plan.num_return_sequences, std::vector<int32_t>{2});
         }
+        completeFirstStage(executor, *wire);
     }
 }
 
@@ -2178,7 +2200,7 @@ TEST_F(PPExecutorTest, FirstSpAdmissionFiltersUnsupportedRequestsBeforeForward) 
         const ScheduleOutput schedule{{failed, healthy}};
         ASSERT_TRUE(executor.process(schedule).ok());
         if (all_failed) {
-            ASSERT_TRUE(executor.drainPendingResults().ok());
+            executor.drainPendingResults();
         }
         EXPECT_TRUE(failed->hasError());
         EXPECT_FALSE(failed->isPPInflight());
@@ -2187,12 +2209,12 @@ TEST_F(PPExecutorTest, FirstSpAdmissionFiltersUnsupportedRequestsBeforeForward) 
         EXPECT_EQ(recorded->inputs.size(), all_failed ? 0u : 1u);
         const auto sent_plan = pp_serialization::deserializePlan(wire->sent_tensors.at(1));
         EXPECT_EQ(sent_plan.model_input.skip_run, all_failed);
-        EXPECT_EQ(executor.slots_[0].result_pending, !all_failed);
-        EXPECT_EQ(wire->receive_index, 0u);
+        EXPECT_EQ(wire->receive_index.load(), 0u);
         if (!all_failed) {
             EXPECT_EQ(tensorToVector<int64_t>(sent_plan.sampling_plan.request_ids), std::vector<int64_t>{202});
             EXPECT_NE(healthy->getSPOutputBuffer(), nullptr);
         }
+        completeFirstStage(executor, *wire);
     }
 }
 
@@ -2227,13 +2249,12 @@ TEST_F(PPExecutorTest, FirstPrefillOnlySkipsSamplingCompatibilityAndDrainsItsRes
         EXPECT_TRUE(executor.token_history_lengths_.empty());
         EXPECT_FALSE(stream->getSPOutputBuffer());
         EXPECT_TRUE(stream->getProposeToken().empty());
-        ASSERT_TRUE(executor.drainPendingResults().ok());
+        executor.drainPendingResults();
         EXPECT_FALSE(stream->hasError());
         EXPECT_FALSE(stream->isPPInflight());
         EXPECT_TRUE(stream->hasEvent(StreamEvents::GenerateDone));
         EXPECT_TRUE(unsupported->committed_tokens.empty());
         EXPECT_EQ(stream->completeTokenIdsVec(0), (std::vector<int>{1, 2}));
-        EXPECT_FALSE(executor.slots_[0].result_pending);
         ASSERT_TRUE(executor.finish().ok());
         expectSlotsDrained(executor);
     }
@@ -2327,6 +2348,11 @@ TEST_F(PPExecutorTpTest, ShutdownPlanStopsEveryTpRankBeforeOrDuringFinishWithout
                                         stage == 2 && type == SP_TYPE_MTP ? propose.get() : nullptr);
                     auto*      wire     = attachTransport(executor);
                     auto*      recorded = installModel<RecordingStageModel>(executor, params.parallelism_config);
+                    broadcasts.on_broadcast = [&] {
+                        if (stage != 2) {
+                            EXPECT_EQ(wire->sent_tensors.size(), 2 * (executor.current_slot_ + 1));
+                        }
+                    };
                     RecordingDraftModel* recorded_draft = nullptr;
                     if (stage == 2 && type == SP_TYPE_MTP) {
                         auto draft            = std::make_unique<RecordingDraftModel>();
@@ -2360,7 +2386,7 @@ TEST_F(PPExecutorTpTest, ShutdownPlanStopsEveryTpRankBeforeOrDuringFinishWithout
                     EXPECT_TRUE(executor.stopped_);
                     EXPECT_TRUE(recorded->inputs.empty());
                     EXPECT_EQ(executor.current_slot_, 2u);
-                    EXPECT_EQ(wire->receive_index, stage == 0 ? 0u : 4u);
+                    EXPECT_EQ(wire->receive_index.load(), stage == 0 ? 0u : 4u);
                     ASSERT_EQ(wire->sent_tensors.size(), stage == 2 ? 0u : 4u);
                     /** TP sync propagates shutdown locally; forwarding preserves each rank's original header value. */
                     if (stage != 2) {
@@ -2378,7 +2404,6 @@ TEST_F(PPExecutorTpTest, ShutdownPlanStopsEveryTpRankBeforeOrDuringFinishWithout
                     EXPECT_TRUE(executor.sampling_states_.empty());
                     EXPECT_TRUE(executor.dspark_q_.empty());
                     for (const auto& batch : executor.slots_) {
-                        EXPECT_FALSE(batch.result_pending);
                         EXPECT_TRUE(batch.plan_sends.empty());
                         EXPECT_TRUE(batch.activation_sends.empty());
                         EXPECT_TRUE(batch.execution_result_sends.empty());
@@ -2404,15 +2429,19 @@ TEST_F(PPExecutorTpTest, FirstTpPeerExecutesSyncedInputWithoutOwningRequests) {
         PPExecutor     executor(params, nullptr, false);
         auto*          wire     = attachTransport(executor);
         auto*          recorded = installModel<RecordingStageModel>(executor, params.parallelism_config);
+        wire->on_send = [&](const torch::Tensor&) {
+            if (wire->sent_tensors.size() < 2) {
+                EXPECT_EQ(broadcasts.position(), 0u);
+            }
+        };
         ScheduleOutput schedule;
         if (rank == 0) {
             schedule.streams = {makeStream(ResourceContext{}, params.model_config_, 101, {1, 2}, 1)};
         }
         ASSERT_TRUE(executor.process(schedule).ok());
         ASSERT_EQ(recorded->inputs.size(), 1u);
-        EXPECT_EQ(wire->receive_index, 0u);
+        EXPECT_EQ(wire->receive_index.load(), 0u);
         EXPECT_EQ(wire->sent_tensors.size(), 5u);
-        EXPECT_EQ(executor.slots_[0].stream_groups.size(), rank == 0 ? 1u : 0u);
         EXPECT_TRUE(executor.sampling_states_.empty());
         if (rank == 0) {
             root_tokens = recorded->inputs[0].combo_tokens.cpu().clone();
@@ -2420,6 +2449,7 @@ TEST_F(PPExecutorTpTest, FirstTpPeerExecutesSyncedInputWithoutOwningRequests) {
             EXPECT_TRUE(torch::equal(recorded->inputs[0].combo_tokens.cpu(), root_tokens));
             EXPECT_EQ(broadcasts.position(), broadcasts.size());
         }
+        completeFirstStage(executor, *wire);
     }
 }
 
@@ -2439,6 +2469,11 @@ TEST_F(PPExecutorTpTest, MiddleTpPeerKeepsUpstreamCacheTagsThroughPlanAndTpSync)
         plan.model_input.kv_cache_kernel_block_id = plan.model_input.kv_cache_block_id.clone();
         enqueuePlan(*wire, plan, rank != 0);
         auto* recorded = installModel<RecordingStageModel>(executor, params.parallelism_config);
+        wire->on_send = [&](const torch::Tensor&) {
+            if (wire->sent_tensors.size() < 2) {
+                EXPECT_EQ(broadcasts.position(), 0u);
+            }
+        };
 
         ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
         ASSERT_EQ(recorded->inputs.size(), 1u);
@@ -2479,7 +2514,7 @@ TEST_F(PPExecutorTest, MiddleStageDecodesCacheUpdateMappingByGroup) {
     ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
 }
 
-/** Inflight batches retain metric ownership until their results are consumed. */
+/** Queued tasks retain metric ownership until their results are processed. */
 TEST_F(PPExecutorTest, FirstPendingBatchKeepsTpsActiveAcrossEmptyRoundsAndExplicitDrain) {
     for (int pp_size : {2, 3, 4}) {
         SCOPED_TRACE(pp_size);
@@ -2495,7 +2530,6 @@ TEST_F(PPExecutorTest, FirstPendingBatchKeepsTpsActiveAcrossEmptyRoundsAndExplic
 
         auto stream = makeStream(ResourceContext{}, params.model_config_, 101, {1, 2}, 1);
         stream->setPPInflight();
-        wire->enqueueObject(pp_serialization::serializeExecutionResult(makeSingleTokenResult(101, 20)));
         ScheduleOutput schedule;
         schedule.streams = {stream};
         ASSERT_TRUE(executor.process(schedule).ok());
@@ -2514,7 +2548,8 @@ TEST_F(PPExecutorTest, FirstPendingBatchKeepsTpsActiveAcrossEmptyRoundsAndExplic
             expect_pending_active();
         }
 
-        ASSERT_TRUE(executor.drainPendingResults().ok());
+        wire->enqueueObject(pp_serialization::serializeExecutionResult(makeSingleTokenResult(101, 20)));
+        executor.drainPendingResults();
         EXPECT_FALSE(stream->isPPInflight());
         EXPECT_EQ(stream->completeTokenIdsVec(0).back(), 20);
         EXPECT_EQ(executor.tps_reporter_.active_count_, 0);
@@ -2523,7 +2558,7 @@ TEST_F(PPExecutorTest, FirstPendingBatchKeepsTpsActiveAcrossEmptyRoundsAndExplic
         EXPECT_TRUE(executor.wall_tps_reporter_.collector_.hasMetrics());
 
         /** Repeated drain and slot reuse must neither reactivate a completed batch nor underflow the count. */
-        ASSERT_TRUE(executor.drainPendingResults().ok());
+        executor.drainPendingResults();
         ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
         EXPECT_EQ(executor.tps_reporter_.active_count_, 0);
         EXPECT_EQ(executor.wall_tps_reporter_.active_count_, 0);
@@ -2537,11 +2572,12 @@ TEST_F(PPExecutorTest, FirstFakeResultIsConsumedWithoutDispatchOrMetrics) {
     ResourceContext resources;
     auto            stream =
         PPExecutor::createMinFakeDecodeStream(params.model_config_, params.runtime_config, resources, params.sp_config);
-    const auto                history = stream->completeTokenIdsVec(0);
-    PPExecutor::InflightBatch batch;
-    batch.result_pending   = true;
-    batch.stream_groups    = StreamGroups({stream});
-    batch.schedule_time_us = autil::TimeUtility::currentTimeInMicroSeconds() - 100000;
+    const auto                     history = stream->completeTokenIdsVec(0);
+    StreamGroups                   stream_groups;
+    int64_t                        schedule_time_us = 0;
+    RtpLLMExecutorMetricsCollector executor_collector;
+    stream_groups    = StreamGroups({stream});
+    schedule_time_us = autil::TimeUtility::currentTimeInMicroSeconds() - 100000;
 
     /** An empty fake result must be consumed without dispatching or stealing the next result. */
     PPExecutionResult fake_result;
@@ -2556,16 +2592,15 @@ TEST_F(PPExecutorTest, FirstFakeResultIsConsumedWithoutDispatchOrMetrics) {
     }
     executor.transport_ = std::move(transport);
 
-    ASSERT_TRUE(executor.processExecutionResult(batch).ok());
-    EXPECT_FALSE(batch.result_pending);
-    EXPECT_EQ(recorded_transport->receive_index, 2);
+    executor.receiveAndProcessResult(stream_groups, schedule_time_us, executor_collector);
+    EXPECT_EQ(recorded_transport->receive_index.load(), 2);
     EXPECT_EQ(stream->completeTokenIdsVec(0), history);
     EXPECT_FALSE(executor.tps_reporter_.collector_.hasMetrics());
     EXPECT_FALSE(executor.wall_tps_reporter_.collector_.hasMetrics());
-    const auto received = pp_serialization::deserializeExecutionResult(executor.receiveObject());
+    const auto received = pp_serialization::deserializeExecutionResult(executor.receiveObject(kPPResultGroupName));
     EXPECT_EQ(tensorToVector<int64_t>(received.request_ids), (std::vector<int64_t>{101}));
     EXPECT_EQ(tensorToVector<int32_t>(received.new_token_ids), (std::vector<int32_t>{7}));
-    EXPECT_EQ(recorded_transport->receive_index, 4);
+    EXPECT_EQ(recorded_transport->receive_index.load(), 4);
 }
 
 TEST_F(PPExecutorTest, FirstPrefillCountsInputWorkEvenWhenSamplingFails) {
@@ -2635,9 +2670,11 @@ TEST_F(PPExecutorTest, FirstReturnedAcceptanceSurvivesBudgetClippingAndCancellat
     cancelled->generate_input_->priority     = 2;
     cancelled->reportError(ErrorCode::CANCELLED, "cancelled while in flight");
 
-    PPExecutor::InflightBatch batch;
-    batch.stream_groups    = StreamGroups(streams);
-    batch.schedule_time_us = autil::TimeUtility::currentTimeInMicroSeconds() - 100000;
+    StreamGroups                   stream_groups;
+    int64_t                        schedule_time_us = 0;
+    RtpLLMExecutorMetricsCollector executor_collector;
+    stream_groups    = StreamGroups(streams);
+    schedule_time_us = autil::TimeUtility::currentTimeInMicroSeconds() - 100000;
     PPExecutionResult result;
     result.request_ids   = torch::tensor({101, 202, 303, 404}, torch::kInt64);
     result.new_token_ids = intTensor({10, 11, 12, 13}).repeat({4, 1});
@@ -2654,8 +2691,8 @@ TEST_F(PPExecutorTest, FirstReturnedAcceptanceSurvivesBudgetClippingAndCancellat
 
     StreamGroups::TokenCountsByPriority     counts;
     RtpLLMSpeculativeEngineMetricsCollector sp_collector;
-    executor.collectTokenCounts(batch.stream_groups, result, counts, sp_collector);
-    ASSERT_TRUE(executor.processExecutionResult(batch).ok());
+    executor.collectTokenCounts(stream_groups, result, counts, sp_collector);
+    executor.receiveAndProcessResult(stream_groups, schedule_time_us, executor_collector);
     EXPECT_EQ(accepted->seqLength(), 4);
     EXPECT_EQ(capped->seqLength(), 3);
     EXPECT_TRUE(capped->hasEvent(StreamEvents::GenerateDone));
@@ -2788,11 +2825,12 @@ TEST_F(PPExecutorTest, FirstResultMetricsAreRestrictedToItsTpRootInEachDpReplica
             stream->setIsContextStream(false);
             stream->generate_input_->priority = 7;
         }
-        PPExecutor::InflightBatch batch;
-        batch.stream_groups                                      = StreamGroups({first, second});
-        const auto now                                           = autil::TimeUtility::currentTimeInMicroSeconds();
-        executor.slots_[executor.current_slot_].schedule_time_us = now;
-        batch.schedule_time_us                                   = now - 100000;
+        StreamGroups                   stream_groups;
+        int64_t                        schedule_time_us = 0;
+        RtpLLMExecutorMetricsCollector executor_collector;
+        stream_groups    = StreamGroups({first, second});
+        const auto now   = autil::TimeUtility::currentTimeInMicroSeconds();
+        schedule_time_us = now - 100000;
 
         /** Verify uses prefill-shaped model inputs, but represents two decode requests. */
         GptModelInputs model_input;
@@ -2800,33 +2838,33 @@ TEST_F(PPExecutorTest, FirstResultMetricsAreRestrictedToItsTpRootInEachDpReplica
         model_input.input_lengths    = intTensor({4, 4});
         model_input.sequence_lengths = intTensor({});
         model_input.combo_tokens     = intTensor({2, 10, 11, 12, 5, 20, 21, 22});
-        executor.collectExecutorMetrics(model_input, intTensor({2, 3}), batch.executor_collector);
+        executor.collectExecutorMetrics(model_input, intTensor({2, 3}), executor_collector);
         PPExecutionResult result;
         result.request_ids = torch::tensor({101, 202}, torch::kInt64);
         result.request_errors.resize(2);
         result.new_token_lengths = intTensor({2, 4});
         StreamGroups::TokenCountsByPriority     counts;
         RtpLLMSpeculativeEngineMetricsCollector sp_collector;
-        executor.collectTokenCounts(batch.stream_groups, result, counts, sp_collector);
+        executor.collectTokenCounts(stream_groups, result, counts, sp_collector);
 
         const auto before = autil::TimeUtility::currentTimeInMicroSeconds();
-        executor.reportResultMetrics(batch, counts, sp_collector);
+        executor.reportResultMetrics(stream_groups, schedule_time_us, executor_collector, counts, sp_collector);
         const auto after   = autil::TimeUtility::currentTimeInMicroSeconds();
         const bool reports = params.parallelism_config.pp_rank == 0 && params.parallelism_config.tp_rank == 0;
         if (reports) {
-            EXPECT_EQ(batch.executor_collector.generate_batch_size, 2);
-            EXPECT_EQ(batch.executor_collector.context_batch_size, 0);
-            EXPECT_EQ(batch.executor_collector.execute_token_size, 8);
-            EXPECT_EQ(batch.executor_collector.max_seq_len, 3);
-            EXPECT_GE(sp_collector.step_latency_us, before - batch.schedule_time_us);
-            EXPECT_LE(sp_collector.step_latency_us, after - batch.schedule_time_us);
+            EXPECT_EQ(executor_collector.generate_batch_size, 2);
+            EXPECT_EQ(executor_collector.context_batch_size, 0);
+            EXPECT_EQ(executor_collector.execute_token_size, 8);
+            EXPECT_EQ(executor_collector.max_seq_len, 3);
+            EXPECT_GE(sp_collector.step_latency_us, before - schedule_time_us);
+            EXPECT_LE(sp_collector.step_latency_us, after - schedule_time_us);
             EXPECT_EQ(sp_collector.spec_steps, 3);
             EXPECT_EQ(sp_collector.total_stream_num, 2);
             EXPECT_EQ(sp_collector.total_propose_token_num, 6);
             EXPECT_EQ(sp_collector.total_accepted_token_num, 6);
         } else {
-            EXPECT_EQ(batch.executor_collector.generate_batch_size, 0);
-            EXPECT_EQ(batch.executor_collector.execute_token_size, 0);
+            EXPECT_EQ(executor_collector.generate_batch_size, 0);
+            EXPECT_EQ(executor_collector.execute_token_size, 0);
             EXPECT_EQ(sp_collector.step_latency_us, 0);
         }
         for (const auto* collector : {&executor.tps_reporter_.collector_, &executor.wall_tps_reporter_.collector_}) {
@@ -2856,17 +2894,19 @@ TEST_F(PPExecutorTest, FirstWarmupAndDisabledReporterDoNotReportResults) {
         }
         auto stream = makeStream(ResourceContext{}, params.model_config_, 101, {1, 2}, 0);
         stream->setIsContextStream(false);
-        PPExecutor::InflightBatch batch;
-        batch.stream_groups    = StreamGroups({stream});
-        batch.schedule_time_us = autil::TimeUtility::currentTimeInMicroSeconds() - 100000;
+        StreamGroups                   stream_groups;
+        int64_t                        schedule_time_us = 0;
+        RtpLLMExecutorMetricsCollector executor_collector;
+        stream_groups    = StreamGroups({stream});
+        schedule_time_us = autil::TimeUtility::currentTimeInMicroSeconds() - 100000;
         PPExecutionResult result;
         result.request_ids = torch::tensor({101}, torch::kInt64);
         result.request_errors.resize(1);
         result.new_token_lengths = intTensor({4});
         StreamGroups::TokenCountsByPriority     counts;
         RtpLLMSpeculativeEngineMetricsCollector sp_collector;
-        executor.collectTokenCounts(batch.stream_groups, result, counts, sp_collector);
-        executor.reportResultMetrics(batch, counts, sp_collector);
+        executor.collectTokenCounts(stream_groups, result, counts, sp_collector);
+        executor.reportResultMetrics(stream_groups, schedule_time_us, executor_collector, counts, sp_collector);
 
         EXPECT_EQ(sp_collector.step_latency_us, 0);
         EXPECT_FALSE(executor.tps_reporter_.collector_.hasMetrics());
@@ -2878,7 +2918,7 @@ TEST_F(PPExecutorTest, FirstWarmupAndDisabledReporterDoNotReportResults) {
     }
 }
 
-TEST_F(PPExecutorTest, FirstInflightMetricsStayWithTheirBatchThroughExecutionAndDrain) {
+TEST_F(PPExecutorTest, FirstQueuedTasksKeepTheirMetricsUntilResultProcessing) {
     auto params = makeMtpParams(3);
     auto cache  = std::make_shared<KVCacheManager>(test::makeSimpleMhaCacheConfig(2, 16, 4, DataType::TYPE_FP16));
     ASSERT_TRUE(cache->init());
@@ -2888,28 +2928,31 @@ TEST_F(PPExecutorTest, FirstInflightMetricsStayWithTheirBatchThroughExecutionAnd
     kmonitor::MetricsTags base_tags("dp_rank", "0");
     executor.metrics_reporter_     = std::make_shared<kmonitor::MetricsReporter>(monitor, "", base_tags);
     int64_t snapshot_time_ms       = 0;
-    auto    expect_sampling_metric = [&](int64_t duration) {
+    auto    expect_executor_metrics = [&](int64_t model_forward_us, int64_t sample_input_us) {
+        const std::unordered_map<std::string, int64_t> durations{{"rtp_llm_model_forward_us", model_forward_us},
+                                                                    {"rtp_llm_sample_input_us", sample_input_us}};
         kmonitor::MetricsCollector snapshot;
         monitor->GetMetrics(&snapshot, {kmonitor::NORMAL}, snapshot_time_ms += 10000);
-        size_t samples = 0;
+        std::unordered_map<std::string, size_t> samples;
         for (const auto* record : snapshot.GetRecords().getRecords()) {
             for (const auto* value : record->Values()) {
-                if (value->Name() != "rtp_llm_sample_input_us") {
+                const auto duration = durations.find(value->Name());
+                if (duration == durations.end()) {
                     continue;
                 }
-                ++samples;
+                ++samples[duration->first];
                 EXPECT_EQ(record->Tags()->FindTag("dp_rank"), "0");
-                // First stage reports its own executor metrics tagged pp_rank=0.
                 EXPECT_EQ(record->Tags()->FindTag("pp_rank"), "0");
                 kmonitor::MinMaxCalculator expected;
-                expected.Add(duration);
+                expected.Add(duration->second);
                 EXPECT_EQ(value->Value(), expected.ToString());
             }
         }
-        EXPECT_EQ(samples, duration > 0 ? 1u : 0u);
+        for (const auto& [name, duration] : durations) {
+            EXPECT_EQ(samples[name], duration > 0 ? 1u : 0u) << name;
+        }
     };
-    executor.setModel(std::make_unique<RecordingDraftModel>());
-    auto            transport = std::make_unique<InMemoryPPTransport>();
+    auto*           wire = attachTransport(executor);
     ResourceContext resources;
     resources.cache_manager = cache;
     auto decode             = makeStream(resources, params.model_config_, 101, {1, 2}, 0);
@@ -2918,12 +2961,12 @@ TEST_F(PPExecutorTest, FirstInflightMetricsStayWithTheirBatchThroughExecutionAnd
         stream->generateConfig()->max_new_tokens = 8;
         stream->fakeInitKVBlock(4);
         stream->setPPInflight();
+        auto sp_buffer          = std::make_shared<SpeculativeExecutorStreamOutput>();
+        sp_buffer->propose_step = 3;
+        sp_buffer->tokens       = torch::zeros({1, 4}, torch::kInt32);
+        stream->setSPOutputBuffer(sp_buffer);
     }
     decode->setIsContextStream(false);
-    auto sp_buffer          = std::make_shared<SpeculativeExecutorStreamOutput>();
-    sp_buffer->propose_step = 3;
-    sp_buffer->tokens       = torch::zeros({1, 4}, torch::kInt32);
-    decode->setSPOutputBuffer(sp_buffer);
 
     PPExecutionResult decode_result;
     decode_result.request_ids       = torch::tensor({101}, torch::kInt64);
@@ -2937,68 +2980,50 @@ TEST_F(PPExecutorTest, FirstInflightMetricsStayWithTheirBatchThroughExecutionAnd
     prefill_result.new_token_ids     = intTensor({14}).reshape({1, 1});
     prefill_result.new_token_lengths = intTensor({1});
     prefill_result.sample_input_us   = 456;
-    for (const auto& result : {decode_result, prefill_result}) {
-        transport->enqueueObject(pp_serialization::serializeExecutionResult(result));
-    }
-    executor.transport_ = std::move(transport);
 
-    const auto schedule_time                       = autil::TimeUtility::currentTimeInMicroSeconds();
-    auto&      retired                             = executor.slots_[1];
-    retired.result_pending                         = true;
-    retired.stream_groups                          = StreamGroups({decode});
-    retired.schedule_time_us                       = schedule_time - 100000;
-    retired.executor_collector.generate_batch_size = 1;
-    retired.executor_collector.execute_token_size  = 4;
-    retired.executor_collector.model_forward_us    = 123;
+    int receive_count = 0;
+    wire->on_receive  = [&](const torch::Tensor&) {
+        /** The next length receive separates batch reports, so aggregation cannot hide mixed task metrics. */
+        if (++receive_count == 3) {
+            EXPECT_EQ(decode->seqLength(), 6);
+            expect_executor_metrics(123, 0);
+            EXPECT_EQ(executor.tps_reporter_.collector_.generateTPS(), 4);
+            EXPECT_FALSE(executor.tps_reporter_.collector_.hasContextTPS());
+        }
+    };
 
-    ScheduleOutput schedule_output;
-    schedule_output.streams = {prefill};
-    ASSERT_TRUE(executor.process(schedule_output, schedule_time).ok());
-    EXPECT_EQ(decode->seqLength(), 6);
+    const auto                     schedule_time = autil::TimeUtility::currentTimeInMicroSeconds();
+    RtpLLMExecutorMetricsCollector decode_collector;
+    decode_collector.pp_rank             = 0;
+    decode_collector.generate_batch_size = 1;
+    decode_collector.execute_token_size  = 4;
+    decode_collector.model_forward_us    = 123;
+    RtpLLMExecutorMetricsCollector prefill_collector;
+    prefill_collector.pp_rank            = 0;
+    prefill_collector.context_batch_size = 1;
+    prefill_collector.execute_token_size = 3;
+    prefill_collector.model_forward_us   = 789;
+
+    /** Distinct collectors queued together expose accidental sharing of per-batch metrics. */
+    executor.enqueueResultTask({StreamGroups({decode}), schedule_time - 100000, decode_collector, {}, {}});
+    executor.enqueueResultTask({StreamGroups({prefill}), schedule_time, prefill_collector, {}, {}});
+    decode_collector.model_forward_us  = 999;
+    prefill_collector.model_forward_us = 999;
+    EXPECT_EQ(decode->seqLength(), 2);
     EXPECT_EQ(prefill->seqLength(), 3);
-    EXPECT_EQ(retired.executor_collector.generate_batch_size, 1);
-    EXPECT_EQ(retired.executor_collector.model_forward_us, 123);
-    EXPECT_EQ(retired.executor_collector.sample_input_us, 0);
-    expect_sampling_metric(0);
-    const auto& admitted = executor.slots_[0];
-    EXPECT_EQ(admitted.schedule_time_us, schedule_time);
-    EXPECT_EQ(admitted.executor_collector.context_batch_size, 1);
-    EXPECT_EQ(admitted.executor_collector.generate_batch_size, 0);
-    EXPECT_EQ(admitted.executor_collector.sample_input_us, 0);
-    EXPECT_EQ(admitted.executor_collector.execute_token_size, 3);
-    EXPECT_EQ(admitted.executor_collector.context_batch_size_when_has_context, 1);
-    EXPECT_EQ(admitted.executor_collector.execute_token_size_when_has_context, 3);
-    EXPECT_EQ(admitted.executor_collector.max_seq_len, 3);
-    EXPECT_EQ(executor.tps_reporter_.collector_.generateTPS(), 4);
-    EXPECT_FALSE(executor.tps_reporter_.collector_.hasContextTPS());
 
-    /** Empty rounds still retire pending results; reusing a slot clears its previous metrics. */
-    ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
-    EXPECT_EQ(retired.executor_collector.generate_batch_size, 0);
-    EXPECT_EQ(retired.executor_collector.model_forward_us, 0);
-    EXPECT_EQ(retired.executor_collector.dispatch_output_us, 0);
-    EXPECT_EQ(retired.executor_collector.sample_input_us, 0);
-    expect_sampling_metric(0);
-    EXPECT_EQ(executor.tps_reporter_.collector_.generateTPS(), 4);
-    EXPECT_EQ(executor.tps_reporter_.collector_.totalTPS(), 4);
-    ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+    for (const auto& result : {decode_result, prefill_result}) {
+        wire->enqueueObject(pp_serialization::serializeExecutionResult(result));
+    }
+    executor.drainPendingResults();
+    EXPECT_EQ(receive_count, 4);
+    EXPECT_EQ(decode->seqLength(), 6);
     EXPECT_EQ(prefill->seqLength(), 4);
-    EXPECT_EQ(admitted.executor_collector.sample_input_us, 456);
-    expect_sampling_metric(456);
-    EXPECT_EQ(admitted.executor_collector.context_batch_size, 1);
-    EXPECT_EQ(admitted.executor_collector.execute_token_size, 3);
+    expect_executor_metrics(789, 456);
     EXPECT_EQ(executor.tps_reporter_.collector_.generateTPS(), 4);
     EXPECT_EQ(executor.tps_reporter_.collector_.totalTPS(), 7);
     EXPECT_TRUE(executor.tps_reporter_.collector_.hasContextTPS());
     EXPECT_EQ(executor.wall_tps_reporter_.collector_.generateTPS(), 4);
-    EXPECT_EQ(executor.wall_tps_reporter_.collector_.totalTPS(), 7);
-    ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
-    EXPECT_EQ(admitted.executor_collector.context_batch_size, 0);
-    EXPECT_EQ(admitted.executor_collector.execute_token_size, 0);
-    EXPECT_EQ(admitted.executor_collector.context_batch_size_when_has_context, 0);
-    EXPECT_EQ(admitted.executor_collector.sample_input_us, 0);
-    expect_sampling_metric(0);
-    EXPECT_EQ(executor.tps_reporter_.collector_.totalTPS(), 7);
     EXPECT_EQ(executor.wall_tps_reporter_.collector_.totalTPS(), 7);
 }
 
@@ -3058,7 +3083,7 @@ TEST_F(PPExecutorTest, MiddleForwardsOriginalPayloadWhileCopyingMultimodalInputs
     const void* received_payload   = nullptr;
     int         forwarded_payloads = 0;
     wire->on_receive               = [&](const torch::Tensor& tensor) {
-        if (wire->receive_index == 1) {
+        if (wire->receive_index.load() == 1) {
             received_payload = tensor.data_ptr();
         }
     };
@@ -3107,7 +3132,7 @@ TEST_F(PPExecutorTest, MiddlePassesActivationsThroughTargetForEachExecutionPhase
         EXPECT_TRUE(torch::equal(wire->sent_tensors.back(), recorded->hidden_buffer.narrow(1, 0, 2)));
         EXPECT_TRUE(executor.sampling_states_.empty());
         EXPECT_EQ(executor.draft_model_, nullptr);
-        EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
+        EXPECT_EQ(wire->receive_index.load(), wire->received_tensors.size());
     }
 }
 
@@ -3127,13 +3152,13 @@ TEST_F(PPExecutorTest, MiddleEmptyPlanSkipsTargetExecutionWithoutStopping) {
     EXPECT_FALSE(executor.stopped_);
     EXPECT_TRUE(recorded->inputs.empty());
     EXPECT_EQ(profile_calls, 0);
-    EXPECT_EQ(wire->receive_index, 2u);
+    EXPECT_EQ(wire->receive_index.load(), 2u);
     enqueuePlan(*wire, makePlan(params));
     ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
     EXPECT_EQ(recorded->inputs.size(), 1u);
     EXPECT_EQ(profile_calls, 2);
     EXPECT_FALSE(executor.stopped_);
-    EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
+    EXPECT_EQ(wire->receive_index.load(), wire->received_tensors.size());
 }
 
 /** Last-stage sampling retains request state and returns results for every completed batch. */
@@ -3327,7 +3352,7 @@ TEST_F(PPExecutorTest, LastHistoryDeltasMatchFullHistorySamplingAcrossReorderedA
             }
         }
         appendCommittedHistory(actual, histories);
-        ASSERT_TRUE(producer.dispatchExecutionResult(groups, actual).ok());
+        producer.dispatchExecutionResult(groups, actual);
         for (const auto& stream : groups.allStreams()) {
             const auto& sequences = histories.at(stream->streamId());
             for (size_t sequence = 0; sequence < sequences.size(); ++sequence) {
@@ -3374,7 +3399,7 @@ TEST_F(PPExecutorTest, LastRetirementAllowsRequestIdReuseWithFreshSamplingState)
         EXPECT_EQ(recorded->inputs.size(), fake_cleanup ? 3u : 2u);
         EXPECT_EQ(wire->sent_tensors.size(), fake_cleanup ? 6u : 4u);
         EXPECT_EQ(tensorToVector<int64_t>(lastResult(*wire).request_ids), (std::vector<int64_t>{101, 202}));
-        EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
+        EXPECT_EQ(wire->receive_index.load(), wire->received_tensors.size());
     }
 }
 
@@ -3581,6 +3606,7 @@ TEST_F(PPExecutorTest, LastOrdinaryAllFailedRequestsStillSendTheirErrors) {
     second->process_error  = error;
     ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
     ASSERT_EQ(wire->sent_tensors.size(), 2u);
+    EXPECT_EQ(wire->sent_groups, (std::vector<std::string>{kPPResultGroupName, kPPResultGroupName}));
     const auto result = lastResult(*wire);
     ASSERT_EQ(result.request_errors.size(), 2u);
     EXPECT_GT(result.sample_input_us, 0);
@@ -3876,9 +3902,7 @@ TEST_F(PPExecutorTest, LastDSparkPublicationWaitsBothWritersBeforeReturningResul
             auto second = makeStream(ResourceContext{}, params.model_config_, 202, {3, 4, 5}, 0);
             first->setPPInflight();
             second->setPPInflight();
-            ASSERT_TRUE(executor.batch_stream_processor_
-                            ->dispatchSpeculativeExecutionResult(StreamGroups({first, second}), result)
-                            .ok());
+            executor.batch_stream_processor_->dispatchSpeculativeExecutionResult(StreamGroups({first, second}), result);
             EXPECT_TRUE(first->hasError());
             EXPECT_TRUE(second->hasError());
             EXPECT_EQ(first->seqLength(), 2);
@@ -4176,7 +4200,7 @@ TEST_F(PPExecutorTest, LastDSparkHistoryDeltasMatchFullHistoryAcrossAcceptedPref
             EXPECT_EQ(tensorToVector<int32_t>(torch::cat(delta_processors.at(id)->committed_tokens, 1)), outputs);
             EXPECT_EQ(tensorToVector<int32_t>(torch::cat(full_processors.at(id)->committed_tokens, 1)), outputs);
         }
-        ASSERT_TRUE(producer.dispatchExecutionResult(groups, actual).ok());
+        producer.dispatchExecutionResult(groups, actual);
         for (const auto& stream : groups.allStreams()) {
             EXPECT_EQ(stream->completeTokenIdsVec(0), histories.at(stream->streamId()).front());
         }
@@ -4686,7 +4710,7 @@ TEST_F(PPExecutorTest, LastOrdinaryFakeReturnsAResultButShutdownSkipsTargetAndDr
             EXPECT_TRUE(executor.stopped_);
             EXPECT_EQ(recorded->inputs.size(), 1u);
             EXPECT_EQ(wire->sent_tensors.size(), 2u);
-            EXPECT_EQ(wire->receive_index, wire->received_tensors.size());
+            EXPECT_EQ(wire->receive_index.load(), wire->received_tensors.size());
             EXPECT_TRUE(executor.sampling_states_.empty());
             EXPECT_TRUE(executor.dspark_q_.empty());
             if (draft_inputs) {

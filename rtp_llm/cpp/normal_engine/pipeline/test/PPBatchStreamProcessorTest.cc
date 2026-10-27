@@ -1382,7 +1382,7 @@ TEST_F(PPBatchStreamProcessorTest, VerifyEngramWindowsFollowAcceptedHistory) {
     result.new_token_ids     = intTensor({20, 0, 0}).reshape({1, 3});
     result.new_token_lengths = intTensor({1});
     result.propose_token_ids = intTensor({21, 22}).reshape({1, 2});
-    ASSERT_TRUE(processor.dispatchExecutionResult(StreamGroups({stream}), result).ok());
+    processor.dispatchExecutionResult(StreamGroups({stream}), result);
     auto next_plan = makePlan(processor, StreamGroups({stream}), history_lengths);
     EXPECT_EQ(tensorToVector<int32_t>(next_plan.sampling_plan.token_ids), (std::vector<int32_t>{20}));
     EXPECT_EQ(tensorToVector<int32_t>(next_plan.model_input.combo_tokens), (std::vector<int32_t>{20, 21, 22}));
@@ -1603,7 +1603,7 @@ TEST_F(PPBatchStreamProcessorTest, MixedBatchReturnsOnlyRequestedRowsAtNonzeroOf
         EXPECT_FALSE(empty.all_hidden_states.defined());
     }
     EXPECT_EQ(tensorToVector<int32_t>(result.new_token_ids), (std::vector<int32_t>{10, 11, 12, 13}));
-    ASSERT_TRUE(processor.dispatchExecutionResult(groups, result).ok());
+    processor.dispatchExecutionResult(groups, result);
     EXPECT_EQ(multi->completeTokenIdsVec(0), (std::vector<int>{3, 4, 5, 11}));
     EXPECT_EQ(multi->completeTokenIdsVec(1), (std::vector<int>{3, 4, 5, 12}));
     for (const auto& stream : {decode, single}) {
@@ -1806,7 +1806,7 @@ TEST_F(PPBatchStreamProcessorTest, PrefillOnlyDispatchFinishesWithoutTokensOrPdH
                 result.request_errors[1] = ErrorInfo(ErrorCode::UNKNOWN_ERROR, "late tail error");
                 result.request_errors[2] = ErrorInfo(ErrorCode::UNKNOWN_ERROR, "tail error");
                 auto processor           = makeProcessor(type, role);
-                ASSERT_TRUE(processor.dispatchExecutionResult(groups, result).ok());
+                processor.dispatchExecutionResult(groups, result);
 
                 EXPECT_FALSE(healthy->hasError());
                 EXPECT_TRUE(healthy->hasEvent(StreamEvents::GenerateDone));
@@ -1855,7 +1855,7 @@ TEST_F(PPBatchStreamProcessorTest, NormalDispatchPreservesProcessorStateAfterLoc
     result.new_token_lengths = intTensor({1});
     stream->setPPInflight();
     auto processor = makeProcessor();
-    ASSERT_TRUE(processor.dispatchExecutionResult(StreamGroups({stream}), result).ok());
+    processor.dispatchExecutionResult(StreamGroups({stream}), result);
 
     EXPECT_FALSE(stream->hasError());
     EXPECT_EQ(head_processor->updates, 1);
@@ -1909,7 +1909,7 @@ TEST_F(PPBatchStreamProcessorTest, NormalDispatchUsesRequestOutputsAcrossMixedPh
     for (const auto& stream : groups.allStreams()) {
         stream->setPPInflight();
     }
-    ASSERT_TRUE(processor.dispatchExecutionResult(groups, result).ok());
+    processor.dispatchExecutionResult(groups, result);
     for (const auto& stream : groups.allStreams()) {
         EXPECT_FALSE(stream->hasError());
         EXPECT_FALSE(stream->isPPInflight());
@@ -1965,7 +1965,7 @@ TEST_F(PPBatchStreamProcessorTest, NormalDispatchSkipsFailedSequencesWithoutShif
         stream->setPPInflight();
     }
     auto processor = makeProcessor();
-    ASSERT_TRUE(processor.dispatchExecutionResult(groups, result).ok());
+    processor.dispatchExecutionResult(groups, result);
     EXPECT_EQ(failed->completeTokenIdsVec(0), (std::vector<int>{1, 2}));
     EXPECT_EQ(failed->completeTokenIdsVec(1), (std::vector<int>{1, 2}));
     EXPECT_EQ(failed->statusInfo().ToString(), result.request_errors[0].ToString());
@@ -1996,7 +1996,7 @@ TEST_F(PPBatchStreamProcessorTest, PrefillDispatchPreservesEachRequestsDraftHand
     result.propose_all_probs[1][0][11] = 1;
     result.propose_hidden_states       = torch::arange(12, torch::kFloat32).reshape({2, 6}).to(torch::kBFloat16);
     auto processor                     = makeProcessor(SP_TYPE_MTP, RoleType::PREFILL);
-    ASSERT_TRUE(processor.dispatchSpeculativeExecutionResult(groups, result).ok());
+    processor.dispatchSpeculativeExecutionResult(groups, result);
     int row = 0;
     for (const auto& stream : {first, second}) {
         const auto buffer = stream->getSPOutputBuffer();
@@ -2038,7 +2038,7 @@ TEST_F(PPBatchStreamProcessorTest, SpeculativeDispatchCommitsAcceptedPrefixesAnd
         result.new_token_lengths = intTensor({1, decode ? 3 : 1});
         result.propose_token_ids = intTensor({31, 32, 33, 23, 24, 25}).reshape({2, 3});
         auto processor           = makeProcessor(SP_TYPE_MTP);
-        ASSERT_TRUE(processor.dispatchExecutionResult(StreamGroups({first, second}), result).ok());
+        processor.dispatchExecutionResult(StreamGroups({first, second}), result);
         auto expected_first = first_history;
         expected_first.push_back(30);
         auto expected_second = second_history;
@@ -2087,7 +2087,7 @@ TEST_F(PPBatchStreamProcessorTest, MixedEosAtLengthBoundaryFinishesOnlyThatReque
         result.new_token_lengths = intTensor({3, 3});
         result.propose_token_ids = intTensor({32, 33, 34, 23, 24, 25}).reshape({2, 3});
         auto processor           = makeProcessor(type);
-        ASSERT_TRUE(processor.dispatchExecutionResult(StreamGroups({finished, continuing}), result).ok());
+        processor.dispatchExecutionResult(StreamGroups({finished, continuing}), result);
         EXPECT_EQ(finished->completeTokenIdsVec(0), expected_finished);
         EXPECT_TRUE(finished->hasEvent(StreamEvents::GenerateDone));
         EXPECT_FALSE(continuing->hasEvent(StreamEvents::GenerateDone));
@@ -2135,7 +2135,7 @@ TEST_F(PPBatchStreamProcessorTest, SpeculativeDispatchKeepsFailedPlaceholderOutO
     result.propose_token_ids = intTensor({10, 11, 12, 22, 23, 24}).reshape({2, 3});
     result.request_errors[0] = ErrorInfo(ErrorCode::GRAMMAR_VERIFY_EXCEPTION, "verify failed");
     auto processor           = makeProcessor(SP_TYPE_MTP);
-    ASSERT_TRUE(processor.dispatchExecutionResult(StreamGroups({failed, healthy}), result).ok());
+    processor.dispatchExecutionResult(StreamGroups({failed, healthy}), result);
     EXPECT_EQ(failed->completeTokenIdsVec(0), (std::vector<int>{1, 2, 9}));
     EXPECT_EQ(failed->getProposeToken(), (std::vector<int>{9, 10, 11, 12}));
     EXPECT_EQ(failed->statusInfo().ToString(), result.request_errors[0].ToString());
@@ -2158,7 +2158,7 @@ TEST_F(PPBatchStreamProcessorTest, CommitOnlyDispatchKeepsProposalsEmpty) {
     result.new_token_ids     = intTensor({20}).reshape({1, 1});
     result.new_token_lengths = intTensor({1});
     auto processor           = makeProcessor(SP_TYPE_DSPARK);
-    ASSERT_TRUE(processor.dispatchExecutionResult(StreamGroups({stream}), result).ok());
+    processor.dispatchExecutionResult(StreamGroups({stream}), result);
     EXPECT_EQ(stream->completeTokenIdsVec(0), (std::vector<int>{1, 2, 20}));
     EXPECT_TRUE(stream->getProposeToken().empty());
     EXPECT_EQ(stream->getSPOutputBuffer()->tokens.flatten()[0].item<int32_t>(), 20);
@@ -2184,7 +2184,7 @@ TEST_F(PPBatchStreamProcessorTest, DSparkDispatchKeepsOnlyTokensForNextPlan) {
     std::unordered_map<RequestId, int32_t> history_lengths;
     const auto                             initial_plan = makePlan(processor, groups, history_lengths);
     EXPECT_EQ(tensorToVector<int32_t>(initial_plan.sampling_plan.token_ids), (std::vector<int32_t>{1, 2, 3, 4}));
-    ASSERT_TRUE(processor.dispatchExecutionResult(groups, result).ok());
+    processor.dispatchExecutionResult(groups, result);
     EXPECT_EQ(first->getProposeToken(), (std::vector<int>{20, 21, 22, 23}));
     EXPECT_EQ(second->getProposeToken(), (std::vector<int>{30, 31, 32, 33}));
     for (const auto& stream : {first, second}) {
@@ -2217,7 +2217,7 @@ TEST_F(PPBatchStreamProcessorTest, SamplingPlanAndHeadCommitShareCapBeyondNextRo
     result.new_token_lengths = intTensor({4});
     result.propose_token_ids = intTensor({14, 15, 16}).reshape({1, 3});
     stream->setPPInflight();
-    ASSERT_TRUE(processor.dispatchExecutionResult(StreamGroups({stream}), result).ok());
+    processor.dispatchExecutionResult(StreamGroups({stream}), result);
     EXPECT_EQ(stream->seqLength(), 59);
     EXPECT_EQ(stream->getProposeToken(), (std::vector<int>{13, 14, 15, 16}));
     EXPECT_TRUE(stream->hasEvent(StreamEvents::GenerateDone));
@@ -2239,7 +2239,7 @@ TEST_F(PPBatchStreamProcessorTest, SpeculativeDispatchClipsRequestBudgetWithoutC
     auto       processor     = makeProcessor(SP_TYPE_MTP);
     const auto plan          = makePlan(processor, StreamGroups({stream})).sampling_plan;
     EXPECT_EQ(plan.max_tokens.item<int32_t>(), 4);
-    ASSERT_TRUE(processor.dispatchExecutionResult(StreamGroups({stream}), result).ok());
+    processor.dispatchExecutionResult(StreamGroups({stream}), result);
     EXPECT_EQ(stream->completeTokenIdsVec(0), (std::vector<int>{1, 2, 9, 10}));
     EXPECT_EQ(result.new_token_lengths.item<int32_t>(), 4);
     EXPECT_EQ(stream->spIterCount(), 1u);
@@ -2301,7 +2301,7 @@ TEST_F(PPBatchStreamProcessorTest, MtpDispatchCommitsAcceptedLinearState) {
         result.propose_token_ids = torch::arange(20, 20 + c.draft_count, torch::kInt32).reshape({1, c.draft_count});
         result.request_outputs.resize(1);
         result.request_errors.resize(1);
-        ASSERT_TRUE(processor.dispatchExecutionResult(StreamGroups({stream}), result).ok());
+        processor.dispatchExecutionResult(StreamGroups({stream}), result);
         EXPECT_FALSE(stream->hasError());
         EXPECT_EQ(stream->seqLength(), c.input_len + std::min(c.num_new_tokens, c.max_new_tokens));
         EXPECT_EQ(resource.blocks("linear"), c.expected_linear_blocks);
@@ -2342,7 +2342,7 @@ TEST_F(PPBatchStreamProcessorTest, DispatchConsumesCancelledOrTimedOutRowsAndPre
                     result.propose_token_ids = intTensor({11, 12, 13, 21, 22, 23}).reshape({2, 3});
                 }
                 auto processor = makeProcessor(type);
-                ASSERT_TRUE(processor.dispatchExecutionResult(groups, result).ok());
+                processor.dispatchExecutionResult(groups, result);
                 EXPECT_EQ(cancelled->statusInfo().ToString(), original_error.ToString());
                 EXPECT_EQ(cancelled->completeTokenIdsVec(0),
                           type == SP_TYPE_NONE ? (std::vector<int>{1, 2}) : (std::vector<int>{1, 2, 9}));
@@ -2387,7 +2387,7 @@ TEST_F(PPBatchStreamProcessorTest, DispatchRetiresInflightWhenEveryRequestWasCan
             result.propose_token_ids = intTensor({11, 12, 13, 21, 22, 23}).reshape({2, 3});
         }
         auto processor = makeProcessor(type);
-        ASSERT_TRUE(processor.dispatchExecutionResult(groups, result).ok());
+        processor.dispatchExecutionResult(groups, result);
         EXPECT_EQ(first->completeTokenIdsVec(0),
                   type == SP_TYPE_NONE ? (std::vector<int>{1, 2}) : (std::vector<int>{1, 2, 9}));
         EXPECT_EQ(second->completeTokenIdsVec(0),

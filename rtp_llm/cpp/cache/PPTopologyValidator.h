@@ -90,12 +90,14 @@ private:
 /** Exchanges serialized snapshots within one (dp_rank, tp_rank) PP lane; all stages in that lane must participate. */
 class PPSnapshotCollector: public StageSnapshotCollector {
 public:
-    explicit PPSnapshotCollector(StageCacheSnapshot local_snapshot): local_(std::move(local_snapshot)) {}
+    PPSnapshotCollector(StageCacheSnapshot local_snapshot, int64_t pp_size):
+        local_(std::move(local_snapshot)), pp_size_(pp_size) {}
 
     std::vector<StageCacheSnapshot> collect() override;
 
 private:
     StageCacheSnapshot local_;
+    int64_t            pp_size_;
 };
 
 /**
@@ -111,10 +113,15 @@ PPValidationResult initPPCacheGeometry(StageSnapshotCollector& collector);
  */
 class PPCacheCapacityNegotiator: public CacheCapacityNegotiator {
 public:
+    explicit PPCacheCapacityNegotiator(int64_t pp_size): pp_size_(pp_size) {}
+
     NegotiatedCapacity negotiate(const CacheConfig&   topology,
                                  uint32_t             local_block_num,
                                  size_t               local_block_tree_combined_stride_bytes,
                                  const RuntimeConfig& runtime_config) override;
+
+private:
+    int64_t pp_size_;
 };
 
 }  // namespace rtp_llm

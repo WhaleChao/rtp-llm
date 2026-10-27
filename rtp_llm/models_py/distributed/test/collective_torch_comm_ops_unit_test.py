@@ -39,6 +39,7 @@ class CollectiveTorchCommOpsUnitTest(unittest.TestCase):
                 },
             ),
             patch.object(collective, "_parallelism_config", config),
+            patch.object(collective, "_get_group", return_value=process_group),
             patch.object(torch.distributed, "get_rank", return_value=0),
         ):
             collective._register_process_groups_to_cpp()
@@ -98,6 +99,7 @@ class CollectiveTorchCommOpsUnitTest(unittest.TestCase):
             world_size=4,
             local_world_size=4,
             tp_rank=0,
+            dp_rank=0,
         )
         allreduce = self._registered_callbacks(config, world_group, stage_group)[1]
         tensor = MagicMock(spec=torch.Tensor)

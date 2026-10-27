@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Union
 import torch
 import torch.distributed
 
-from rtp_llm.models_py.distributed.rank_layout import Group, RankLayout
+from rtp_llm.models_py.distributed.rank_layout import Coord, Group, RankLayout
 from rtp_llm.ops import NcclCommConfig, ParallelismConfig
 
 # ParallelMode enum values matching C++ rtp_llm::ParallelMode in OpData.h
@@ -18,9 +18,11 @@ _CPP_PARALLEL_MODE_TP = 0
 _CPP_PARALLEL_MODE_DP = 1
 _CPP_PARALLEL_MODE_WORLD = 2
 _CPP_PARALLEL_MODE_STAGE = 6
-# P2PBackend enum values matching C++ rtp_llm::P2PBackend in ExecOps.h
-_CPP_P2P_BACKEND_NCCL = 0
-_CPP_P2P_BACKEND_GLOO = 1
+_CPP_PARALLEL_MODE_PP = 7
+# Local ProcessGroup aliases matching PPTransport.h.
+_PP_DEVICE_GROUP_NAME = "pp.device"
+_PP_CPU_GROUP_NAME = "pp.cpu"
+_PP_RESULT_GROUP_NAME = "pp.result"
 _UDS_SUN_PATH_LIMIT = 108
 
 
@@ -183,10 +185,6 @@ def init_distributed_environment(
                 disable_custom_all_reduce,
             )
             _register_process_groups_to_cpp()
-            if parallelism_config.pp_size > 1:
-                register_pp_process_group(
-                    _get_group(Group.PP), _get_group(Group.PP, cpu_backend=True)
-                )
         rocm_rccl = _get_rocm_rccl()
         if rocm_rccl is not None and parallelism_config.tp_size > 1:
             rocm_rccl.prepare_comm_if_needed(parallelism_config, _get_group(Group.TP))
@@ -223,10 +221,6 @@ def init_distributed_environment(
         _parallelism_config = parallelism_config
         _initialized = True
         _register_process_groups_to_cpp()
-        if parallelism_config.pp_size > 1:
-            register_pp_process_group(
-                _get_group(Group.PP), _get_group(Group.PP, cpu_backend=True)
-            )
         if rocm_rccl is not None and parallelism_config.tp_size > 1:
             rocm_rccl.prepare_comm_if_needed(parallelism_config, _get_group(Group.TP))
         _init_flashinfer_allreduce(parallelism_config, disable_custom_all_reduce)
@@ -267,10 +261,6 @@ def init_distributed_environment(
     _parallelism_config = parallelism_config
     _initialized = True
     _register_process_groups_to_cpp()
-    if parallelism_config.pp_size > 1:
-        register_pp_process_group(
-            _get_group(Group.PP), _get_group(Group.PP, cpu_backend=True)
-        )
     if rocm_rccl is not None and parallelism_config.tp_size > 1:
         rocm_rccl.prepare_comm_if_needed(parallelism_config, _get_group(Group.TP))
     init_user_buffers_environment(parallelism_config)
@@ -283,7 +273,7 @@ def _create_process_groups(
     timeout: Optional[timedelta],
     disable_custom_all_reduce: Optional[bool] = None,
 ):
-    """Create stage-local DP/TP/STAGE groups and cross-stage PP lane groups.
+    """Create stage-local groups, PP lanes, and root-to-root result groups.
 
     Args:
         parallelism_config: Configuration for parallelism setup
@@ -406,7 +396,20 @@ def _create_process_groups(
                 logging.info(
                     f"[rank: {world_rank}] Stored PP group with key: {group_key} {pp_group} with ranks: {pp_ranks}"
                 )
-            torch.distributed.barrier()
+        # Blocking result receives must not stall plan traffic; use a separate
+        # Gloo group for the first and last stages' TP=0 ranks.
+        for dp_rank in range(dp_size):
+            result_ranks = [
+                layout.world_rank_of(Coord(tp=0, dp=dp_rank, pp=pp_rank))
+                for pp_rank in (0, pp_size - 1)
+            ]
+            result_group = torch.distributed.new_group(
+                ranks=result_ranks,
+                backend="gloo",
+                timeout=timedelta(days=36500),
+            )
+            if world_rank in result_ranks:
+                _group_map[f"PP_RESULT{dp_rank}"] = result_group
     else:
         _group_map[Group.STAGE] = torch.distributed.group.WORLD
 
@@ -492,6 +495,16 @@ def _register_process_groups_to_cpp():
         if pg_world is not None:
             mode_to_group[_CPP_PARALLEL_MODE_DP] = pg_world
 
+    p2p_groups: Dict[str, torch.distributed.ProcessGroup] = {}
+    if _parallelism_config is not None and _parallelism_config.pp_size > 1:
+        pp_group = _get_group(Group.PP)
+        mode_to_group[_CPP_PARALLEL_MODE_PP] = pp_group
+        p2p_groups[_PP_DEVICE_GROUP_NAME] = pp_group
+        p2p_groups[_PP_CPU_GROUP_NAME] = _get_group(Group.PP, cpu_backend=True)
+        result_group = _group_map.get(f"PP_RESULT{_parallelism_config.dp_rank}")
+        if result_group is not None:
+            p2p_groups[_PP_RESULT_GROUP_NAME] = result_group
+
     # NOTE: These callbacks are NOT thin wrappers around the module-level broadcast()/
     # all_reduce()/all_gather() because the C++ calling convention differs significantly:
     #   - C++ uses int mode (ParallelMode enum ordinal) instead of Group enum
@@ -513,7 +526,7 @@ def _register_process_groups_to_cpp():
         Args:
             tensors: Tensors to broadcast, each is broadcast in-place from root.
             root: Source rank that holds the data.
-            mode: ParallelMode int (0=TP, 1=DP, 2=WORLD, 6=STAGE) selecting process group.
+            mode: ParallelMode int (0=TP, 1=DP, 2=WORLD, 6=STAGE, 7=PP) selecting process group.
         """
         pg = mode_to_group.get(mode)
         if pg is None or pg.size() < 2:
@@ -542,7 +555,7 @@ def _register_process_groups_to_cpp():
         Args:
             tensor: Input tensor to reduce.
             op: ReduceOp int (0=SUM, 1=PROD, 2=MAX, 3=MIN, 4=AVG).
-            mode: ParallelMode int (0=TP, 1=DP, 2=WORLD, 6=STAGE) selecting process group.
+            mode: ParallelMode int (0=TP, 1=DP, 2=WORLD, 6=STAGE, 7=PP) selecting process group.
             dest: If not None, result is written here instead of reducing in-place on tensor.
         Returns:
             The reduced tensor (dest if provided, otherwise tensor).
@@ -575,7 +588,7 @@ def _register_process_groups_to_cpp():
 
         Args:
             recv_buffers: Output tensors, each of size [world_size * per_rank_numel].
-            mode: ParallelMode int (0=TP, 1=DP, 2=WORLD, 6=STAGE) selecting process group.
+            mode: ParallelMode int (0=TP, 1=DP, 2=WORLD, 6=STAGE, 7=PP) selecting process group.
             send_buffers: Per-rank input tensors (used when inplace=False).
             inplace: If True, each rank's send data is extracted from its slice in recv_buffers;
                      if False, send data comes from send_buffers.
@@ -628,7 +641,27 @@ def _register_process_groups_to_cpp():
             if recv_on_cpu:
                 recv_buf.copy_(gpu_recv)
 
-    librtp_compute_ops.register_comm_ops(cpp_broadcast, cpp_allreduce, cpp_allgather)
+    def cpp_isend(
+        tensor: torch.Tensor,
+        global_peer: int,
+        group_name: str,
+    ):
+        return torch.distributed.isend(
+            tensor, dst=global_peer, group=p2p_groups[group_name]
+        )
+
+    def cpp_irecv(
+        tensor: torch.Tensor,
+        global_peer: int,
+        group_name: str,
+    ):
+        return torch.distributed.irecv(
+            tensor, src=global_peer, group=p2p_groups[group_name]
+        )
+
+    librtp_compute_ops.register_comm_ops(
+        cpp_broadcast, cpp_allreduce, cpp_allgather, cpp_isend, cpp_irecv
+    )
     logging.info(
         f"Registered C++ comm ops callbacks (modes: {list(mode_to_group.keys())})"
     )
@@ -655,82 +688,6 @@ def _register_process_groups_to_cpp():
             f"Initialized CpuTpBroadcaster (tp_rank={_parallelism_config.tp_rank}, "
             f"tp_size={_parallelism_config.tp_size}, base_path={base_path})"
         )
-
-
-def register_pp_process_group(
-    process_group: torch.distributed.ProcessGroup,
-    cpu_process_group: torch.distributed.ProcessGroup,
-) -> None:
-    """Register C++ PP transport and startup snapshot callbacks."""
-    try:
-        import librtp_compute_ops
-    except ImportError:
-        logging.debug("librtp_compute_ops not available, skip PP comm ops registration")
-        return
-
-    if not hasattr(librtp_compute_ops, "register_pp_ops"):
-        logging.debug("register_pp_ops not available, skip PP comm ops registration")
-        return
-
-    group_ranks = torch.distributed.get_process_group_ranks(process_group)
-    backend_to_group = {
-        _CPP_P2P_BACKEND_NCCL: process_group,
-        _CPP_P2P_BACKEND_GLOO: cpu_process_group,
-    }
-
-    def _get_p2p_group(backend: int) -> torch.distributed.ProcessGroup:
-        if backend not in backend_to_group:
-            raise ValueError(f"Unsupported P2P backend: {backend}")
-        return backend_to_group[backend]
-
-    def _check_peer(global_peer: int) -> int:
-        if global_peer not in group_ranks:
-            raise RuntimeError(
-                f"global peer {global_peer} is not a member of the PP "
-                f"transport group {group_ranks}"
-            )
-        return global_peer
-
-    def cpp_isend(tensor: torch.Tensor, global_peer: int, backend: int):
-        work = torch.distributed.isend(
-            tensor,
-            dst=_check_peer(global_peer),
-            group=_get_p2p_group(backend),
-        )
-        if work is None:
-            raise RuntimeError("isend returned no work")
-        return work
-
-    def cpp_irecv(tensor: torch.Tensor, global_peer: int, backend: int):
-        work = torch.distributed.irecv(
-            tensor,
-            src=_check_peer(global_peer),
-            group=_get_p2p_group(backend),
-        )
-        if work is None:
-            raise RuntimeError("irecv returned no work")
-        return work
-
-    # Snapshot results are indexed by pp_rank.
-    def cpp_pp_snapshot_exchange(snapshot_bytes: bytes) -> List[bytes]:
-        payloads: List[bytes] = [b""] * cpu_process_group.size()
-        torch.distributed.all_gather_object(
-            payloads, snapshot_bytes, group=cpu_process_group
-        )
-        return payloads
-
-    librtp_compute_ops.register_pp_ops(cpp_isend, cpp_irecv, cpp_pp_snapshot_exchange)
-    logging.info("Registered PP communication callbacks (p2p + snapshot exchange)")
-
-
-def unregister_pp_process_group() -> None:
-    try:
-        import librtp_compute_ops
-    except ImportError:
-        return
-
-    if hasattr(librtp_compute_ops, "clear_pp_ops"):
-        librtp_compute_ops.clear_pp_ops()
 
 
 def distributed_environment_initialized() -> bool:
@@ -786,8 +743,6 @@ def destroy_distributed_environment():
 
         destroy_user_buffers_communicator()
         _get_flashinfer_allreduce().destroy_flashinfer_allreduce()
-
-    unregister_pp_process_group()
 
     try:
         import librtp_compute_ops
